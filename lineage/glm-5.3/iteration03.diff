@@ -1,0 +1,332 @@
+--- iteration02/context.py
++++ iteration03/context.py
+@@ -23,10 +23,11 @@
+ CLIP_TAIL = 5000
+ 
+ TRIM_NOTE = (
+-    "[harness] The conversation grew past the context budget, so tool output and "
+-    "replayed reasoning from older turns were dropped. The commands and their "
+-    "outcomes are still listed; for anything you need verbatim, keep it in a file "
+-    "in the container and re-read it from there."
++    "[harness] The conversation grew past the context budget, so tool output, "
++    "replayed reasoning and old narration were dropped; the recent turns are "
++    "intact. The task statement is at /tmp/.harness_task.md and your plan at "
++    "/tmp/.harness_plan.md — re-read them from there rather than trusting "
++    "memory, and keep facts you will need again in a file in the container."
+ )
+ 
+ 
+@@ -77,27 +78,44 @@
+     return n
+ 
+ 
+-def compact(messages, *, keep_last=8, hard=False, target_chars=200000):
+-    """Trim history in place, keeping the last `keep_last` tool results verbatim."""
++def _stub(content, keep=300):
++    """What a dropped block leaves behind: its size, then its opening."""
++    return f"[dropped for context, {len(content)} chars] " + content[:keep]
++
++
++def compact(messages, *, keep_last=8, hard=False, target_chars=160000):
++    """Trim history in place until it really is under `target_chars`.
++
++    A trim that cannot reach its target is worse than none: the history sits
++    at the trigger, every later turn trims again, and the window still fills.
++    So `hard` runs a schedule of passes that protect less and less — the last
++    few results, then fewer, then one — and each pass also drops the replayed
++    reasoning of older turns and stubs the model's own long narration, which
++    is where the bulk of a chatty history actually is. The very last tool
++    result is never stubbed: it is the one the model has not answered yet.
++    `size()` decides when to stop, so what leaves the window fits it.
++    """
+     touched = 0
+-    tool_idx = [i for i, m in enumerate(messages) if m.get("role") == "tool"]
+-    protected = set(tool_idx[-keep_last:])
+-    if hard:
+-        asst = [i for i, m in enumerate(messages) if any(m.get(k) for k in STASH)]
+-        for i in asst[: max(len(asst) - keep_last, 0)]:
+-            for k in STASH:
+-                messages[i].pop(k, None)
+-            touched += 1
+-    for i in tool_idx:
++    schedule = (keep_last,) if not hard else (
++        keep_last, max(keep_last // 2, 2), 2, 1)
++    for keep in schedule:
++        for i, m in enumerate(messages):
++            if any(m.get(k) for k in STASH) and i < len(messages) - keep - 1:
++                for k in STASH:
++                    m.pop(k, None)
++                touched += 1
++        tool_idx = [i for i, m in enumerate(messages) if m.get("role") == "tool"]
++        for i in tool_idx[:-keep] if keep else tool_idx[:-1]:
++            content = str(messages[i].get("content") or "")
++            if len(content) >= 600:
++                messages[i]["content"] = _stub(content)
++                touched += 1
++        if hard:
++            for m in messages:
++                c = m.get("content")
++                if m.get("role") == "assistant" and isinstance(c, str) and len(c) > 1500:
++                    m["content"] = _stub(c, 600)
++                    touched += 1
+         if size(messages) <= target_chars:
+             break
+-        if i in protected:
+-            continue
+-        content = str(messages[i].get("content") or "")
+-        if len(content) < 600:
+-            continue
+-        messages[i]["content"] = (
+-            f"[older tool result, {len(content)} chars, dropped for context]" + content[:200]
+-        )
+-        touched += 1
+     return touched
+--- iteration02/harness.py
++++ iteration03/harness.py
+@@ -1,18 +1,25 @@
+ """The agent loop: a bounded bash tool, the task's MCP tools as first-class
+-tools, a durable plan, and two guards that keep a run from ending empty.
+-
+-The context guard is the old one: measure the real prompt length, clip each
+-result to what the window can afford, shed replayed reasoning when the
+-measurement says to. The finish guard is new, and exists because the plainest
+-way to lose a task is to stop one reply too early — the model writes the
+-answer into its final message, the run ends, and nothing outside the
+-conversation ever sees it. So a reply with no tool call is bounced back once
+-with the check it needs to make, and only a second such reply ends the run.
+-
+-Between them sits the clock: tool results carry the elapsed seconds, and at a
+-few milestones the harness adds what it can see of the world — how many files
+-have actually changed — next to the reminder that the budget is unknown and
+-runs get cut off without warning.
++tools, a durable plan, and three guards that keep a run from ending empty.
++
++The context guard measures the real prompt length, clips each result to what
++the window can afford, and — once a rejection or the trigger says the window
++is nearer than assumed — compacts until the history is *actually* inside it,
++learning from the rejection where the limit lies. A failed call is retried,
++but never endlessly unchanged: the task statement and the plan also live in
++files the conversation cannot lose.
++
++The finish guard exists because the plainest way to lose a task is to stop
++one reply too early — the model writes the answer into its final message, the
++run ends, and nothing outside the conversation ever sees it. So a reply with
++no tool call is bounced back once with the checks it needs to make —
++deliverable in place, nothing new arrived unhandled, nothing still open — and
++only a second such reply ends the run.
++
++Between them sits the clock: tool results carry the elapsed seconds, a
++command that ate a quarter of the run says so, and at a few milestones the
++harness adds what it can see of the world — how many files have actually
++changed, whether a plan exists at all — next to the reminder that the budget
++is unknown and runs get cut off without warning.
+ """
+ 
+ import json
+@@ -22,9 +29,10 @@
+ from .mcp import Bridge
+ from .prompts import FINISH_CHECK, SYSTEM_PROMPT, milestone_note
+ 
+-BASH_TIMEOUT_S = 420.0     # a command that outlives this is killed and reported
+-PROMPT_TRIGGER = 110_000   # measured prompt tokens that make us trim the history
+-MILESTONES_S = (420.0, 900.0, 1800.0, 2700.0)
++BASH_TIMEOUT_S = 300.0     # a command that outlives this is killed and reported
++PROMPT_TRIGGER = 70_000    # measured prompt tokens that make us trim the history
++MILESTONES_S = (300.0, 720.0, 1500.0, 2600.0)
++TASK_FILE = "/tmp/.harness_task.md"
+ MAX_BOUNCES = 2            # finish checks: the second only if work happened since
+ PLAN_FILE = "/tmp/.harness_plan.md"
+ 
+@@ -88,7 +96,7 @@
+     return "[" + " | ".join(parts) + "]"
+ 
+ 
+-async def run_bash(world, arguments, t0, plan, hist_chars):
++async def run_bash(world, arguments, t0, plan, hist_chars, stats):
+     args = arguments if isinstance(arguments, dict) else {}
+     cmd = str(args.get("command") or "")
+     if not cmd.strip():
+@@ -99,6 +107,7 @@
+         limit = BASH_TIMEOUT_S
+     if "<" not in cmd:  # no heredoc in it, so closing stdin is safe
+         cmd = f"( {cmd} ) </dev/null"
++    t1 = time.monotonic()
+     try:
+         r = await world.exec(cmd, timeout_s=limit)
+     except Exception as e:
+@@ -108,8 +117,29 @@
+                 "waiting on stdin or a reply sits here until its bound expires.\n"
+                 + footer(t0, plan))
+     parts = [r.stdout or ""] + (["[stderr]\n" + r.stderr] if r.stderr else [])
++    spent, took = time.monotonic() - t0, time.monotonic() - t1
++    stats["longest_exec_s"] = max(stats.get("longest_exec_s", 0), round(took))
++    if took > 60 and took > 0.2 * spent:  # a probe that ate the run's clock
++        parts.append(f"[this command took {int(took)}s — {int(100 * took / spent)}% "
++                     "of the run so far; bound the next such probe with "
++                     "`timeout <secs>`, or run it in the background and poll]")
+     parts.append(f"[exit {r.return_code}] " + footer(t0, plan))
+     return context.clip("\n".join(parts), limit=context.clip_budget(hist_chars))
++
++
++async def write_brief(world, instruction):
++    """The task statement, verbatim on disk: the one text a trim must not eat.
++
++    Every later safety net points here — the trim note, the plan's footer —
++    so a model whose conversation was compacted can re-read what it was asked
++    for instead of reconstructing it from a summary of a summary.
++    """
++    try:
++        await world.exec("mkdir -p /tmp && cat > " + TASK_FILE
++                         + " <<'HTASK_EOF'\n" + instruction + "\nHTASK_EOF", timeout_s=20)
++        return True
++    except Exception:
++        return False
+ 
+ 
+ async def run_plan(world, steps, t0, plan):
+@@ -139,22 +169,31 @@
+     stats = {"execs": 0, "mcp_calls": 0, "trims": 0, "unknown_tools": 0,
+              "peak_prompt_tokens": 0, "mcp_servers": [], "mcp_tools": 0,
+              "bounces": 0, "milestones": 0, "plan_updates": 0,
+-             "files_changed_last": None, "final_reply_chars": None}
++             "files_changed_last": None, "final_reply_chars": None,
++             "context_errors": 0, "prompt_trigger": PROMPT_TRIGGER,
++             "longest_exec_s": 0, "model_retries": 0}
+     bridge = Bridge(world)
+     defs, names = await bridge.discover(instruction)
+     stats["mcp_servers"], stats["mcp_tools"] = [s[0] for s in bridge.servers], len(defs)
+     facts = await observe.survey(world)     # one look at the container, so the
+     stats["survey_chars"] = len(facts or "")  # first turn is not spent on `ls`
+-    messages = [{"role": "system", "content": SYSTEM_PROMPT + (
+-                     "\n\n[harness] One look at this container, taken before your "
+-                     "first turn — what is installed and what is where. It is a "
+-                     "starting point, not the whole picture; check anything that "
+-                     "matters.\n" + facts if facts else "")},
++    brief = await write_brief(world, instruction)
++    opening = ""
++    if facts:
++        opening = ("\n\n[harness] One look at this container, taken before your "
++                   "first turn — what is installed and what is where. It is a "
++                   "starting point, not the whole picture; check anything that "
++                   "matters.\n" + facts)
++    if brief:
++        opening += ("\n[harness] The task statement is saved verbatim at " + TASK_FILE
++                    + ", and your plan once recorded at " + PLAN_FILE
++                    + ". Anything the conversation drops can be re-read from there.")
++    messages = [{"role": "system", "content": SYSTEM_PROMPT + opening},
+                 {"role": "user", "content": instruction}]
+     tools, note, retries, backup = [BASH] + defs + [PLAN], None, 0, None
+-    plan, bounces, worked, milestone_i = [], 0, False, 0
+-
+-    def trim(keep_last=8, target=200000):
++    plan, bounces, worked, milestone_i, trigger = [], 0, False, 0, PROMPT_TRIGGER
++
++    def trim(keep_last=8, target=160_000):
+         nonlocal note
+         stats["trims"] += context.compact(messages, keep_last=keep_last, hard=True, target_chars=target)
+         if note is None:
+@@ -172,10 +211,24 @@
+                 if retries > 3:           # try again while there is anything to try
+                     raise
+                 if "context" in str(e).lower():
+-                    trim(keep_last=2, target=0)   # it would not fit: shed history
++                    # The rejection itself says where the window is: pull the
++                    # trigger below the prompt that failed, so the run does
++                    # not walk back into the same wall next turn.
++                    stats["context_errors"] += 1
++                    trigger = min(trigger, max(24_000, int(stats["peak_prompt_tokens"] * 0.6)))
++                    stats["prompt_trigger"] = trigger
++                    trim(keep_last=2, target=24_000)
+                 elif backup is not None:  # a trim is not guaranteed to be accepted,
+                     messages[:] = backup  # so put the history back and try once more
+                     backup = None
++                elif retries >= 2:
++                    # The same request has now failed twice, unchanged. A
++                    # gateway's own limits — a generation cut-off, a stream
++                    # that never came back — do not care that the request is
++                    # legal, and resending it identically only burns the clock
++                    # the task needed. Send something smaller and carry on.
++                    stats["model_retries"] = retries
++                    trim(keep_last=4, target=60_000)
+                 continue
+             retries, backup = 0, None
+             messages.append(reply.message)
+@@ -193,7 +246,7 @@
+                 if call.name == "bash":
+                     stats["execs"] += 1
+                     out = await run_bash(world, call.arguments, t0, plan,
+-                                         context.size(messages))
++                                         context.size(messages), stats)
+                 elif call.name == "plan":
+                     stats["plan_updates"] += 1
+                     out = await run_plan(world, call.arguments.get("steps")
+@@ -214,10 +267,11 @@
+                 stats["milestones"] = milestone_i
+                 stats["files_changed_last"] = await observe.changed_files(world)
+                 messages.append({"role": "user", "content": milestone_note(
+-                    time.monotonic() - t0, stats["files_changed_last"])})
++                    time.monotonic() - t0, stats["files_changed_last"],
++                    observe.render_plan(plan))})
+             used = model.input_tokens - before    # measured prompt length of that call
+             stats["peak_prompt_tokens"] = max(stats["peak_prompt_tokens"], used)
+-            if used > PROMPT_TRIGGER:             # trim once the turn is on the record
++            if used > trigger:                   # trim once the turn is on the record
+                 backup = [dict(m) for m in messages]
+                 trim()
+     finally:  # /logs/agent is collected with the trial: leave the next round a report
+--- iteration02/prompts.py
++++ iteration03/prompts.py
+@@ -18,8 +18,8 @@
+ 5. Bound anything that can run long: pass `timeout_s`, use `timeout <secs>` inside the command, or start the job in the background writing to a log and poll that log. Never park the run in a blind `sleep`. Interactive programs see EOF on stdin, so feed them by flag, file, or pipe instead of waiting at a prompt.
+ 6. Tools beside `bash` come from the task's own MCP servers — call them as tools, which is the supported path; hand-rolled JSON-RPC over `curl` is slower and fragile. Each takes the arguments its schema describes, plus an optional `_timeout_s` saying how long to wait. If a server you were told about is not listed, you can still reach it from `bash`.
+ 7. Tool results end with the seconds elapsed since the run began. You are not told the total budget and runs get cut off without warning, so treat the clock as the only deadline you have: never leave the deliverable unwritten while you refine, and when a reminder arrives, re-land a complete version before going on.
+-8. A reply with no tool call ends the run, and it reaches only the harness: it is not written to a file, shown to a user, or sent anywhere the task can see. Land the deliverable with a tool — the file the task names, or the message the task routes through one of its own tools. Never answer a question that arrives *inside* the task (from a user, a program, a prompt on stdin) in a bare reply: deliver it through the channel it came from. Say your final summary only once nothing is missing.
+-9. Before finishing, re-read the task statement and check your own work: run the task's own checks or tests if any are visible, confirm the deliverable is where and how it was asked for, and confirm nothing you were asked to do is still open. Fix what you find, then check again.
++8. A reply with no tool call ends the run, and it reaches only the harness: it is not written to a file, shown to a user, or sent anywhere the task can see. Land the deliverable with a tool — the file the task names, or the message the task routes through one of its own tools. Never answer a question that arrives *inside* the task (from a user, a program, a prompt on stdin) in a bare reply: deliver it through the channel it came from. Where the task's conditions depend on what the world does next — a reply, a result, a state that appears later — re-read the statement each time new input arrives and act on what became true; do not end the run while a condition is still waiting on something. Say your final summary only once nothing is missing.
++9. Before finishing, re-read the task statement and check your own work: run the task's own checks or tests if any are visible, confirm the deliverable is where and how it was asked for, and confirm nothing you were asked to do is still open. An answer that is a number or a short fact deserves a second independent route — recompute it another way, or take it from a second source — because one long derivation that is wrong looks exactly like one that is right. Fix what you find, then check again.
+ 10. Anything you write under `/logs/agent/` is kept with the run's record and read later by whoever maintains this harness. If a tool, the environment, or your own approach wasted the run, a line or two there is worth more than silence. Never spend task time on it.
+ 
+ When the task is complete, reply with a final message and no tool calls.
+@@ -30,18 +30,23 @@
+ # delivered. It deliberately makes "nothing is missing" the cheap path.
+ FINISH_CHECK = (
+     "[harness] You replied without calling a tool, so this run is one reply "
+-    "from ending. Before it does, one check, because a reply is not delivered "
+-    "anywhere: it is not a file, not a message, not a submission, and nothing "
+-    "outside this conversation sees it. If the task's deliverable is already in "
+-    "place exactly as asked — the file exists where it must, whatever had to be "
+-    "sent through a tool was sent, the checks you were pointed at were run — "
+-    "reply once more with no tool call and restate your final answer. If "
+-    "anything is missing, do it now and finish afterwards. Do not redo or "
+-    "polish work that is already complete."
++    "from ending. A reply is delivered nowhere — it is not a file, not a "
++    "message, not a submission, and nothing outside this conversation sees "
++    "it. Before it ends, three checks. (1) Is the deliverable in place "
++    "exactly as asked: the file exists where it must, whatever had to be sent "
++    "through a tool was sent, the checks you were pointed at were run? "
++    "(2) Has anything arrived or changed since you last looked — a message, "
++    "a reply, a notification, a new or modified file, a state you were "
++    "waiting on — that you have not yet acted on, and did some condition in "
++    "the task statement become true in the meantime that was false before? "
++    "(3) Is anything you were asked to do still open? If all three are clear, "
++    "reply once more with no tool call and restate your final answer. "
++    "Otherwise do it now and finish afterwards. Do not redo or polish work "
++    "that is already complete."
+ )
+ 
+ 
+-def milestone_note(elapsed_s, changed):
++def milestone_note(elapsed_s, changed, plan_line=""):
+     """The clock reminder, with whatever the world probe managed to observe."""
+     note = (
+         f"[harness] t+{int(elapsed_s)}s elapsed. You are not told how much "
+@@ -53,4 +58,9 @@
+     if changed is not None:
+         note += (" Files created or modified in the container's working "
+                  f"directories since the run began: {changed}.")
++    if not plan_line:
++        note += (" No plan is recorded. If the task still has conditions, "
++                 "branches or steps outstanding, put them in `plan` now: it "
++                 "survives the context trims that drop the turns they were "
++                 "first thought in, and this reminder does not.")
+     return note

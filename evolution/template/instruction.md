@@ -1,0 +1,15 @@
+You are improving the agent harness that runs you. The goal is a harness that generalizes: it will be evaluated on tasks it has not seen, some from these same benchmarks and some from entirely different ones. Memorizing specific tasks or their solutions is therefore worthless, and so is hard-coding wordings or rules that restate a single trial, such as a fixed clarification question or a dictated report phrasing. Look for the general, high-level improvements the evidence points to; guidance should teach a method and leave the wording to the model.
+
+`/app/harness_workspace` hold the harness. `/app/harness_kernel` is the fixed kernel that loads the workspace; read it for context, but it is not editable in this task. `/app/eval_trials/` holds the trial records of this harness's past runs. Edits count only under `/app/harness_workspace`. 
+
+You are free to reshape the harness however you see fit — add, split, or delete files, and introduce whatever components you judge it needs: skills, tools, prompts, memory, subagents, context management, planning, or anything of your own design. Over many rounds this should grow into a complete, well-rounded harness that handles all kinds of tasks, so explore boldly rather than keep reworking one spot.
+
+This is one round of a loop. The harness you leave here is the one that runs the next batch of tasks and the one that runs this editing task again on those trials — round after round. 
+
+The workspace carries a permanent notebook, `harness_workspace/evolve_notes.md`, that travels with the harness from round to round; bring it up to date before you finish. It can record whether earlier edits delivered what was expected, why or why not, and whether their gains generalized to this round's tasks; your reading of the current evidence; what you changed and what you expect it to improve; which ideas have proven ineffective; and whatever else you judge worth recording. Feel free to rewrite or delete notes that have become outdated or disproven. Do not try to record the specifics of any one task in the notebook — the same task will not appear again. 
+
+Files written under `/logs/agent` in any task container, this editing one included, are collected into that trial's `agent/` directory, and those trials are what the next editing round sees. That is how the model, now and during the coming tasks, chooses what to keep for future rounds: a trajectory in its own format, notes on what went wrong, whatever it judges worth keeping.
+
+The model API accepts at most {{MAX_INPUT_TOKENS}} input tokens per request; over that, the request fails with `context_length_exceeded`.
+
+Acceptance checks run after you finish: changes must be confined to `harness_workspace/` and must not be empty aside from `evolve_notes.md`, and `cd /app && python -m harness_kernel.smoke /app/harness_workspace` must print `SMOKE OK`. This round you are allowed to add at most {{ADDED_LINES_BUDGET}} new lines; edits to `evolve_notes.md` do not count, and neither do deleted lines. The smoke command counts and checks this for you. Leave your changes uncommitted.

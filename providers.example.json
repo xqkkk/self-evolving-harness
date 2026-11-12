@@ -1,0 +1,53 @@
+{
+  "gpt-5.6-sol-high": {
+    "comment": "Responses API with a client-side ceiling of 258,400 input tokens, as in the paper.",
+    "kind": "model_clients.capped_responses:CappedResponsesModel",
+    "base_url": "https://api.openai.com/v1",
+    "api_key_env": "OPENAI_API_KEY",
+    "model": "gpt-5.6-sol",
+    "reasoning_effort": "high",
+    "max_output_tokens": 65536,
+    "max_input_tokens": 258400
+  },
+  "gpt-5.6-sol-high-openrouter": {
+    "comment": "The same model through OpenRouter's Responses endpoint, endpoints sorted by price.",
+    "kind": "model_clients.capped_responses:CappedResponsesModel",
+    "base_url": "https://openrouter.ai/api/v1",
+    "api_key_env": "OPENROUTER_API_KEY",
+    "model": "openai/gpt-5.6-sol",
+    "reasoning_effort": "high",
+    "max_output_tokens": 65536,
+    "max_input_tokens": 258400,
+    "extra_body": {"provider": {"sort": "price"}}
+  },
+  "gpt-5.6-luna-high": {
+    "kind": "model_clients.capped_responses:CappedResponsesModel",
+    "base_url": "https://api.openai.com/v1",
+    "api_key_env": "OPENAI_API_KEY",
+    "model": "gpt-5.6-luna",
+    "reasoning_effort": "high",
+    "max_output_tokens": 65536,
+    "max_input_tokens": 258400
+  },
+  "glm-5.3-max": {
+    "comment": "Chat Completions on OpenRouter, fp8 endpoints only, sorted by price.",
+    "kind": "model_clients.openrouter_chat:OpenRouterChatModel",
+    "api_key_env": "OPENROUTER_API_KEY",
+    "model": "z-ai/glm-5.3",
+    "reasoning_effort": "max",
+    "thinking": true,
+    "max_tokens": 65536,
+    "max_input_tokens": 258400,
+    "provider": {"quantizations": ["fp8"], "allow_fallbacks": true}
+  },
+  "glm-5.3-flash-max": {
+    "kind": "model_clients.openrouter_chat:OpenRouterChatModel",
+    "api_key_env": "OPENROUTER_API_KEY",
+    "model": "z-ai/glm-5.3-flash",
+    "reasoning_effort": "max",
+    "thinking": true,
+    "max_tokens": 65536,
+    "max_input_tokens": 258400,
+    "provider": {"quantizations": ["fp8"], "allow_fallbacks": true}
+  }
+}

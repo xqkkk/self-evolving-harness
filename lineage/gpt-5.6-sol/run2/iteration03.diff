@@ -1,0 +1,328 @@
+--- iteration02/harness.py
++++ iteration03/harness.py
+@@ -14,7 +14,7 @@
+ 2. Form a short evidence-based plan, then execute it. Prefer narrow searches and bounded output. Exclude generated, minified, dependency, and build directories unless they are genuinely relevant. Redirect potentially large output to a file and inspect selected ranges or summaries. Put explicit timeouts around commands that might hang.
+ 3. Validate independently before finishing. Check required artifacts exist and match the requested format. For code, understand surrounding conventions and tests, fix the root cause rather than a one-off example, consider boundary/error cases, run focused tests and then the broadest practical checks, and review the final diff. A newly failing existing test is evidence of a compatibility bug: fix it rather than excluding it or declaring it obsolete. Do not weaken tests or unrelated behavior.
+ 4. For document/data questions, distinguish exact definitions, populations, period/date, units, signs, totals versus components, and percent versus decimal. Inspect table titles, headings, row/column alignment and footnotes; when revisions matter, find the latest source that reports the requested period and verify that later sources did not revise it. State the observations and formula, calculate with a script, and re-read the source context as an independent check. Do not silently substitute a similar metric.
+-5. For interactive scenarios, treat the requested action and its stopping point literally; do not extend a preparatory or informational request into a downstream committing operation. Capture the initial state when relevant, inspect every notification and tool error, honor temporal cutoffs, and verify final state after consequential actions. After a timeout or transport failure, inspect state before replaying any call that may already have committed. Do not announce completion before waits or follow-up events are resolved, and do not send an unrequested user-facing update. If the protocol requires an initial tool call, make it before conversational text; a readiness statement is not completion.
++5. For interactive scenarios, treat the requested action and its stopping point literally; do not extend a preparatory or informational request into a downstream committing operation. Capture the initial state when relevant, inspect every notification and tool error, honor temporal cutoffs, and verify final state after consequential actions. Re-evaluate the full request when new messages arrive; do not guess a materially ambiguous target or execute multiple possible interpretations. Calls in one assistant turn run concurrently, so batch only independent operations—put reads and dependent or ordered mutations in separate turns. After a timeout or transport failure, inspect state before replaying any call that may already have committed. Do not announce completion before waits or follow-up events are resolved, and do not send an unrequested user-facing update. If the protocol requires an initial tool call, make it before conversational text; a readiness statement is not completion.
+ 6. Manage the task's time as a resource. Sample or benchmark potentially expensive work before scaling it, prefer batching or parallelism over long serial loops, set realistic command timeouts, and preserve enough time for validation and the required artifact. If one approach is too slow or repeatedly fails, diagnose once and switch strategies rather than retrying blindly.
+ 
+ Tool output shown to you may be abbreviated when it is very large; the full command still ran. If that happens, rerun a targeted query or save and inspect the relevant slice. Preserve user work. Keep going until the result is verified, then give a concise final response and make no further tool calls."""
+@@ -76,7 +76,7 @@
+         {"role": "system", "content": SYSTEM_PROMPT},
+         {"role": "user", "content": instruction},
+     ]
+-    bridge = MCPBridge(world)
++    bridge = MCPBridge(world, model)
+     mcp_tools, errors = await bridge.discover(instruction)
+     if errors:
+         messages.append({"role":"system", "content":"\n".join(errors)})
+--- iteration02/mcp_bridge.py
++++ iteration03/mcp_bridge.py
+@@ -3,22 +3,66 @@
+ MCP endpoints are reachable from the task container, while this harness runs in
+ the agent container.  The bridge therefore performs protocol requests through
+ ``world.exec`` and turns advertised MCP tools into ordinary model tools.
++
++A call may ask its MCP client to perform model sampling.  Calls run as detached
++workers in the task container so the harness can service those reverse JSON-RPC
++requests without closing the original HTTP response stream.
+ """
+ 
++import asyncio
+ import base64
+ import itertools
+ import json
+ import re
+ import shlex
+-
+-# This is installed in /tmp in the task container.  Reading only through the
+-# matching JSON-RPC response is important: streamable HTTP responses may leave
+-# their SSE connection open indefinitely after delivering the result.
+-_REMOTE = r'''import json, sys, urllib.request, urllib.error
++import time
++import uuid
++
++_REMOTE = r'''import json, os, sys, time, urllib.request
+ url, mode = sys.argv[1], sys.argv[2]
+ sid = None if sys.argv[3] == "-" else sys.argv[3]
+ payload = json.loads(sys.argv[4])
+ rpc_id = int(sys.argv[5])
++job = sys.argv[6] if len(sys.argv) > 6 else None
++request_no = 0
++
++def atomic_write(path, value):
++    tmp = path + ".tmp"
++    with open(tmp, "w") as f:
++        json.dump(value, f)
++    os.replace(tmp, path)
++
++def reverse_request(value):
++    global request_no
++    method = value.get("method", "")
++    ident = value.get("id")
++    if ident is None:
++        return
++    if method == "roots/list":
++        answer = {"jsonrpc":"2.0", "id":ident, "result":{"roots":[]}}
++    elif job:
++        request_no += 1
++        token = str(request_no)
++        atomic_write(os.path.join(job, "request_" + token + ".json"), value)
++        response_path = os.path.join(job, "response_" + token + ".json")
++        deadline = time.monotonic() + 600
++        while not os.path.exists(response_path):
++            if time.monotonic() >= deadline:
++                answer = {"jsonrpc":"2.0", "id":ident,
++                          "error":{"code":-32000,"message":"client response timed out"}}
++                break
++            time.sleep(.1)
++        else:
++            with open(response_path) as f:
++                answer = json.load(f)
++            try: os.unlink(response_path)
++            except OSError: pass
++            try: os.unlink(os.path.join(job, "request_" + token + ".json"))
++            except OSError: pass
++    else:
++        answer = {"jsonrpc":"2.0", "id":ident,
++                  "error":{"code":-32601,"message":"client capability unavailable"}}
++    post(answer, False)
+ 
+ def post(obj, want=True):
+     global sid
+@@ -27,8 +71,6 @@
+     if sid: h["Mcp-Session-Id"] = sid
+     if mode != "init": h["MCP-Protocol-Version"] = "2025-03-26"
+     req = urllib.request.Request(url, data=data, headers=h, method="POST")
+-    # This is an idle socket timeout, not a wall-clock limit. SSE keepalives can
+-    # legitimately arrive while a remote operation performs slow model work.
+     with urllib.request.urlopen(req, timeout=900) as r:
+         sid = r.headers.get("Mcp-Session-Id", sid)
+         if not want:
+@@ -43,23 +85,32 @@
+                 continue
+             try: value = json.loads(line[5:].strip())
+             except Exception: continue
+-            if value.get("id") == obj.get("id"):
++            if value.get("id") == obj.get("id") and ("result" in value or "error" in value):
+                 return value
++            if value.get("method") and "id" in value:
++                reverse_request(value)
+         raise RuntimeError("MCP stream ended without a matching response")
+ 
+-try:
++def main():
+     if mode == "init":
+         ans = post({"jsonrpc":"2.0", "id":1, "method":"initialize", "params":{
+-            "protocolVersion":"2025-03-26", "capabilities":{},
++            "protocolVersion":"2025-03-26",
++            "capabilities":{"sampling":{}, "roots":{"listChanged":False}},
+             "clientInfo":{"name":"agent-harness", "version":"1"}}})
+         post({"jsonrpc":"2.0", "method":"notifications/initialized", "params":{}}, False)
+         tools = post({"jsonrpc":"2.0", "id":2, "method":"tools/list", "params":{}})
+-        print(json.dumps({"ok":True, "session":sid, "initialize":ans, "tools":tools}))
+-    else:
+-        ans = post({"jsonrpc":"2.0", "id":rpc_id, "method":"tools/call", "params":payload})
+-        print(json.dumps({"ok":True, "response":ans}))
++        return {"ok":True, "session":sid, "initialize":ans, "tools":tools}
++    ans = post({"jsonrpc":"2.0", "id":rpc_id, "method":"tools/call", "params":payload})
++    return {"ok":True, "response":ans}
++
++try:
++    result = main()
+ except Exception as e:
+-    print(json.dumps({"ok":False, "error":type(e).__name__+": "+str(e)}))
++    result = {"ok":False, "error":type(e).__name__+": "+str(e)}
++if job:
++    atomic_write(os.path.join(job, "result.json"), result)
++else:
++    print(json.dumps(result))
+ '''
+ 
+ _DECL = re.compile(
+@@ -69,12 +120,14 @@
+ 
+ 
+ class MCPBridge:
+-    def __init__(self, world):
++    def __init__(self, world, model=None):
+         self.world = world
++        self.model = model
+         self.servers = {}
+         self.routes = {}
+         self._path = "/tmp/agent_harness_mcp.py"
+         self._ids = itertools.count(100)
++        self._tag = uuid.uuid4().hex[:10]
+ 
+     async def discover(self, instruction):
+         """Initialize declared HTTP servers and return OpenAI-format tools."""
+@@ -90,8 +143,7 @@
+         found = []
+         errors = []
+         for server_name, url in declarations:
+-            payload = json.dumps({})
+-            cmd = self._command(url, "init", "-", payload, 0)
++            cmd = self._command(url, "init", "-", json.dumps({}), 0)
+             try:
+                 out = await self.world.exec(cmd, timeout_s=330)
+                 data = self._last_json(out.stdout)
+@@ -114,7 +166,6 @@
+         for server_name, item in found:
+             remote = item["name"]
+             public = remote if counts[remote] == 1 else f"{server_name}__{remote}"
+-            # Keep names legal for common model APIs.
+             public = re.sub(r"[^A-Za-z0-9_-]", "_", public)[:64]
+             base = public
+             suffix = 2
+@@ -131,19 +182,118 @@
+             }})
+         return tools, errors
+ 
+-    def _command(self, url, mode, sid, payload, rpc_id):
++    def _command(self, url, mode, sid, payload, rpc_id, job=None):
+         args = ["python3", self._path, url, mode, sid or "-", payload, rpc_id]
++        if job:
++            args.append(job)
+         return " ".join(shlex.quote(str(x)) for x in args)
+ 
+     @staticmethod
+     def _last_json(text):
+-        # Shell startup noise is unusual but should not make the transport fail.
+         for line in reversed(text.splitlines()):
+             try:
+                 return json.loads(line)
+             except json.JSONDecodeError:
+                 pass
+         raise ValueError("no JSON response from MCP transport: " + text[-500:])
++
++    async def _sample(self, request):
++        """Fulfil an MCP sampling request using the harness model."""
++        ident = request.get("id")
++        params = request.get("params") or {}
++        method = request.get("method")
++        if method != "sampling/createMessage" or self.model is None:
++            return {"jsonrpc":"2.0", "id":ident, "error":{
++                "code":-32601, "message":f"Unsupported client request: {method}"}}
++
++        messages = []
++        if params.get("systemPrompt"):
++            messages.append({"role":"system", "content":str(params["systemPrompt"])})
++        for item in params.get("messages") or []:
++            content = item.get("content", "")
++            if isinstance(content, dict):
++                if content.get("type") == "text":
++                    content = content.get("text", "")
++                else:
++                    content = json.dumps(content, ensure_ascii=False)
++            elif isinstance(content, list):
++                content = "\n".join(
++                    str(x.get("text", "")) if isinstance(x, dict) else str(x)
++                    for x in content
++                )
++            role = item.get("role")
++            messages.append({"role": role if role in ("user", "assistant") else "user",
++                             "content": str(content)})
++        if not messages:
++            messages = [{"role":"user", "content":"Provide the requested sample."}]
++        reply = await self.model.chat(messages, tools=None)
++        text = reply.text or reply.message.get("content") or ""
++        return {"jsonrpc":"2.0", "id":ident, "result":{
++            "model":str(getattr(self.model, "model", "harness-model")),
++            "stopReason":"endTurn", "role":"assistant",
++            "content":{"type":"text", "text":text},
++        }}
++
++    async def _worker_call(self, url, sid, payload, rpc_id):
++        job = f"/tmp/agent_mcp_{self._tag}_{rpc_id}"
++        command = self._command(url, "call", sid, payload, rpc_id, job)
++        launch = (
++            f"rm -rf {shlex.quote(job)}; mkdir -p {shlex.quote(job)}; "
++            f"({command} >/dev/null 2>{shlex.quote(job + '/stderr')}; "
++            f"echo $? > {shlex.quote(job + '/exit')}) "
++            f"</dev/null >/dev/null 2>&1 &"
++        )
++        out = await self.world.exec(launch, timeout_s=30)
++        if out.return_code:
++            raise RuntimeError((out.stderr or "could not launch MCP worker").strip())
++
++        deadline = time.monotonic() + 600
++        handled = set()
++        while time.monotonic() < deadline:
++            # Wait in the task container to avoid a recorded exec every 100 ms.
++            poll = (
++                f"for i in $(seq 1 40); do "
++                f"[ -f {shlex.quote(job + '/result.json')} ] && "
++                f"{{ echo RESULT; cat {shlex.quote(job + '/result.json')}; exit; }}; "
++                f"[ -f {shlex.quote(job + '/exit')} ] && "
++                f"{{ echo FAILED; cat {shlex.quote(job + '/stderr')}; exit; }}; "
++                f"f=$(find {shlex.quote(job)} -maxdepth 1 -name 'request_*.json' "
++                f"-type f | sort | head -1); "
++                f"[ -n \"$f\" ] && {{ echo REQUEST:$f; cat \"$f\"; exit; }}; "
++                f"sleep .5; done; echo WAIT"
++            )
++            state = await self.world.exec(poll, timeout_s=30)
++            lines = state.stdout.splitlines()
++            if not lines:
++                continue
++            if lines[0] == "RESULT":
++                return json.loads("\n".join(lines[1:]))
++            if lines[0] == "FAILED":
++                raise RuntimeError("MCP worker exited: " + "\n".join(lines[1:])[-1000:])
++            if lines[0].startswith("REQUEST:"):
++                path = lines[0][8:]
++                if path in handled:
++                    await asyncio.sleep(.2)
++                    continue
++                handled.add(path)
++                request = json.loads("\n".join(lines[1:]))
++                try:
++                    response = await asyncio.wait_for(self._sample(request), timeout=540)
++                except Exception as exc:
++                    response = {"jsonrpc":"2.0", "id":request.get("id"), "error":{
++                        "code":-32000, "message":f"client sampling failed: {exc}"}}
++                token = re.search(r"request_(\d+)\.json$", path)
++                if not token:
++                    raise RuntimeError("invalid MCP reverse-request path")
++                response_path = f"{job}/response_{token.group(1)}.json"
++                encoded = base64.b64encode(json.dumps(response).encode()).decode()
++                temporary = response_path + ".tmp"
++                write = (f"echo {shlex.quote(encoded)} | base64 -d > {shlex.quote(temporary)}; "
++                         f"mv {shlex.quote(temporary)} {shlex.quote(response_path)}")
++                wr = await self.world.exec(write, timeout_s=30)
++                if wr.return_code:
++                    raise RuntimeError("could not answer MCP reverse request: " + wr.stderr)
++        raise TimeoutError("MCP call did not finish within 600 seconds")
+ 
+     async def call(self, public_name, arguments):
+         server_name, remote_name = self.routes[public_name]
+@@ -153,27 +303,13 @@
+             separators=(",", ":"), ensure_ascii=False,
+         )
+         try:
+-            # A tool may itself wait on a human or model.  The former 330s cap
+-            # repeatedly cancelled valid long-lived calls; allow one bounded
+-            # wait instead of encouraging ambiguous retries of side effects.
+-            out = await self.world.exec(
+-                self._command(url, "call", sid, payload, next(self._ids)),
+-                timeout_s=930,
+-            )
+-            if out.return_code:
+-                detail = (out.stderr or out.stdout or "no diagnostic output").strip()
+-                return f"MCP transport process exited {out.return_code}: {detail[-1000:]}"
+-            data = self._last_json(out.stdout)
++            data = await self._worker_call(url, sid, payload, next(self._ids))
+             if not data.get("ok"):
+                 return "MCP transport error: " + str(data.get("error"))
+             response = data.get("response") or {}
+             if response.get("error"):
+                 return "MCP error: " + json.dumps(response["error"], ensure_ascii=False)
+             result = response.get("result")
+-            # MCP SDKs normally present content blocks to the agent.  Returning
+-            # both content and structuredContent often duplicates a very large
+-            # payload verbatim, so prefer readable content while preserving
+-            # errors and non-text blocks.
+             if isinstance(result, dict) and isinstance(result.get("content"), list):
+                 rendered = []
+                 for block in result["content"]:

@@ -1,0 +1,551 @@
+--- seed/harness.py
++++ iteration01/harness.py
+@@ -1,49 +1,292 @@
+-SYSTEM_PROMPT = (
+-    "You are an autonomous agent working inside a Linux container.\n"
+-    "Use the bash tool to inspect the environment and complete the task.\n"
+-    "Never cheat: do not obtain the answer by searching the internet or any "
+-    "similar shortcut; solve the task yourself.\n"
+-    "When the task is done, reply with a final message and no tool calls."
+-)
+-
+-TOOLS = [
+-    {
+-        "type": "function",
+-        "function": {
+-            "name": "bash",
+-            "description": "Run a bash command in the task container and return its output.",
+-            "parameters": {
+-                "type": "object",
+-                "properties": {
+-                    "command": {"type": "string", "description": "The command to run."}
+-                },
+-                "required": ["command"],
+-            },
+-        },
+-    }
+-]
++"""Agent harness: one bash tool plus, when the task declares MCP servers, those
++servers' tools exposed natively. Shaped by past trials: (1) MCP tasks burned
++5-10 model calls hand-rolling MCP clients over bash, with avoidable failures -
++now a stdlib-only bridge is installed in the container before the first model
++call and each server's tools are exposed with their real schemas, degrading to
++bash-only with a note if that fails; (2) provider generation cutoffs used to
++kill runs permanently - transient model-call failures are retried and a
++context overflow trims old tool outputs; (3) tool results are clipped, tagged
++with elapsed wall-clock time, and identical repeated calls get a loop guard.
++"""
++
++import asyncio
++import json
++import shlex
++import time
++from pathlib import Path
++
++HERE = Path(__file__).resolve().parent
++BRIDGE_SOURCE = (HERE / "mcp_bridge.py").read_text(encoding="utf-8")
++
++MCP_DIR = "/tmp/.harness_mcp"
++BRIDGE_DELIM = "HARNESS_BRIDGE_EOF_7c31"
++MCP_LIST_TIMEOUT_S = 120.0
++MCP_CALL_TIMEOUT_S = 600.0
++TOOL_OUTPUT_LIMIT = 40000
++TOOL_HEAD = 26000
++TOOL_TAIL = 10000
++MCP_NOTE_HEADER = "MCP servers reachable from inside the task container:"
++
++BASH_TOOL = {"type": "function", "function": {
++    "name": "bash",
++    "description": "Run a bash command in the task container and return its output.",
++    "parameters": {"type": "object",
++                   "properties": {"command": {"type": "string", "description": "The command to run."}},
++                   "required": ["command"]}}}
++
++SYSTEM_PROMPT = """You are an autonomous agent completing a task in a Linux container. Work through tool calls
++until the task is done, then reply with a final message and no tool calls.
++
++Working method:
++1. Pin down the deliverable before acting: exactly what artifact, answer, or effect is required (file paths, formats, names, recipients), and any constraints or acceptance criteria the task states.
++2. Inventory before you build: look at the working directory, the inputs, and what is already installed (interpreters, packages, CLI tools); prefer what exists over downloading or rebuilding; sample data formats before parsing.
++3. Work in small verified steps: run a command, read the result, adjust. When something fails, read the actual error and change something - do not repeat the same call expecting a different result.
++4. Be economical with output: search and slice (grep -n, sed -n, head, tail) instead of dumping whole files; batch related commands into one call.
++5. Checkpoint the deliverable: as soon as a required artifact exists in acceptable form, write it to the requested location; refine afterwards if time allows. Never leave a task without its deliverable in place.
++6. Verify before finishing: re-read the task's requirements and check each against what you actually produced (exact path, exact format, the value actually asked for); if a checker or test suite exists, run it.
++7. When the task asks a question, make your final message state the exact answer plainly - the precise value, name, or phrase requested - not just reasoning around it.
++
++Each tool result is clipped if very long (a marker shows what was dropped) and ends with the run's elapsed wall-clock time. Use that to pace yourself: leave a margin for verification and delivery instead of exploring until you are cut off. Long installs, builds, or training runs are usually the wrong trade; get a working deliverable first, improve it after.
++
++If your tool list includes tools provided by the task (for example simulated apps or a service the task runs), those are the intended way to interact with that environment: call them directly like any other tool rather than reconstructing them in bash, and read each result fully (including any notifications or follow-up messages it reports) before deciding the next step. If the task assigns you a role with a policy - say, a support agent - follow that policy over your own defaults.
++
++Never cheat: do not obtain the answer from any source that carries it rather than solving the task yourself."""
++
++
++def parse_mcp_servers(instruction):
++    """Parse the MCP-server note the kernel appends to the instruction."""
++    if MCP_NOTE_HEADER not in instruction:
++        return []
++    servers = []
++    for line in instruction.split(MCP_NOTE_HEADER, 1)[1].splitlines():
++        line = line.strip()
++        if not line.startswith("- "):
++            if servers:
++                break
++            continue
++        name, _, rest = line[2:].partition(":")
++        name, rest = name.strip(), rest.strip()
++        if " at " in rest:
++            servers.append({"name": name, "transport": "http", "url": rest.split(" at ", 1)[1].strip()})
++        elif rest.startswith("stdio via "):
++            servers.append({"name": name, "transport": "stdio",
++                            "command": shlex.split(rest[len("stdio via "):].strip().strip("`").strip())})
++    return [s for s in servers if s.get("url") or s.get("command")]
++
++
++def clip_output(text):
++    if len(text) <= TOOL_OUTPUT_LIMIT:
++        return text
++    dropped = len(text) - TOOL_HEAD - TOOL_TAIL
++    return (text[:TOOL_HEAD]
++            + "\n...[%d characters dropped; if you need the middle, re-run with a narrower"
++              " query (grep -n, sed -n, head, tail)]...\n" % dropped
++            + text[-TOOL_TAIL:])
++
++
++def time_tag(t0):
++    return "[elapsed %.1f min]" % ((time.monotonic() - t0) / 60.0)
++
++def _last_json(text):
++    for line in reversed((text or "").splitlines()):
++        if line.strip().startswith("{"):
++            try:
++                out = json.loads(line)
++            except Exception:
++                continue
++            if isinstance(out, dict):
++                return out
++    return None
++
++
++PY_CMD = "$(command -v python3 || command -v python)"
++
++def _target_args(server):
++    if server["transport"] == "http":
++        return "--url " + shlex.quote(server["url"])
++    return "--stdio " + " ".join(shlex.quote(c) for c in server["command"])
++
++
++def _safe_name(name, existing):
++    clean = "".join(c if (c.isalnum() or c in "_-") else "_" for c in str(name))[:60] or "tool"
++    taken = {t["tool_name"] for t in existing}
++    if clean not in taken:
++        return clean
++    i = 2
++    while "%s_%d" % (clean, i) in taken:
++        i += 1
++    return "%s_%d" % (clean, i)
++
++
++def _params(schema):
++    if not isinstance(schema, dict):
++        return {"type": "object", "properties": {}}
++    schema.setdefault("type", "object")
++    schema.setdefault("properties", {})
++    return schema
++
++
++async def _list_tools(world, server):
++    last = "no attempt"
++    for _ in range(2):
++        r = await world.exec("%s %s/bridge.py list %s" % (PY_CMD, MCP_DIR, _target_args(server)),
++                             timeout_s=MCP_LIST_TIMEOUT_S + 30)
++        env = _last_json(r.stdout)
++        if env and env.get("ok"):
++            return env.get("tools") or []
++        last = ((env or {}).get("error") if env else None) or (r.stderr or r.stdout or "no output")[-300:]
++        await asyncio.sleep(2.0)
++    return "tool listing failed: %s" % last
++
++
++async def setup_mcp(world, servers):
++    """Write the bridge into the container; discover each server's tools.
++    Returns (tools, notes) where tools carry tool_name/mcp_name/description/
++    parameters/server and notes describe anything that failed."""
++    install = ("mkdir -p %(dir)s && cat > %(dir)s/bridge.py <<'%(delim)s'\n%(src)s\n%(delim)s\n"
++               "PY=$(command -v python3 || command -v python); echo \"PY=$PY\""
++               % {"dir": MCP_DIR, "delim": BRIDGE_DELIM, "src": BRIDGE_SOURCE})
++    r = await world.exec(install, timeout_s=120)
++    if r.return_code != 0 or "PY=" not in (r.stdout or ""):
++        return [], ["bridge install failed (rc=%s): %s"
++                    % (r.return_code, (r.stderr or r.stdout or "")[-300:])]
++    tools, notes = [], []
++    for s in servers:
++        got = await _list_tools(world, s)
++        if isinstance(got, str):
++            notes.append("server %s: %s" % (s["name"], got))
++            continue
++        if not got:
++            notes.append("server %s: no tools listed" % s["name"])
++        for t in got:
++            tools.append({"tool_name": _safe_name(t["name"], tools), "mcp_name": t["name"],
++                          "description": (t.get("description") or "")[:2000],
++                          "parameters": _params(t.get("inputSchema")), "server": s})
++    return tools, notes
++
++
++async def call_mcp(world, tool, args):
++    cmd = "%s %s/bridge.py call %s --name %s --args %s --timeout %s" % (
++        PY_CMD, MCP_DIR, _target_args(tool["server"]), shlex.quote(tool["mcp_name"]),
++        shlex.quote(json.dumps(args or {})), MCP_CALL_TIMEOUT_S)
++    try:
++        r = await world.exec(cmd, timeout_s=MCP_CALL_TIMEOUT_S + 90)
++    except Exception as exc:
++        return "MCP transport error: %s: %s" % (type(exc).__name__, exc)
++    env = _last_json(r.stdout)
++    if not env:
++        return "MCP error: no usable response (exit %s); stderr: %s" % (
++            r.return_code, (r.stderr or "")[-300:])
++    if not env.get("ok"):
++        return "MCP error: %s" % json.dumps(env.get("error"), ensure_ascii=True)[:2000]
++    parts = [item.get("text") or "" if isinstance(item, dict) and item.get("type") == "text"
++             else "[non-text content: %s]" % json.dumps(item, ensure_ascii=True)[:200]
++             for item in env.get("content") or []]
++    out = "\n".join(p for p in parts if p)
++    structured = env.get("structuredContent")
++    if structured is not None and structured != {}:
++        out = (out + "\n" if out else "") + json.dumps(structured, ensure_ascii=True)
++    if not out:
++        out = "(tool returned no content)"
++    return ("The tool reported an error:\n" if env.get("isError") else "") + out
++
++
++async def exec_bash(world, args):
++    command = args.get("command") if isinstance(args, dict) else None
++    if not isinstance(command, str) or not command.strip():
++        return "bash error: no command given"
++    try:
++        r = await world.exec(command)
++    except Exception as exc:
++        return "bash error: %s: %s" % (type(exc).__name__, exc)
++    parts = [r.stdout]
++    if r.stderr:
++        parts.append("[stderr]\n" + r.stderr)
++    parts.append("[exit %s]" % r.return_code)
++    return "\n".join(p for p in parts if p)
++
++
++def _is_context_error(text):
++    text = text.lower()
++    return ("context length" in text or "context_length" in text or "too large" in text
++            or "too long" in text or "input tokens" in text)
++
++
++def _shrink_history(messages, keep_last=6):
++    """Trim old tool outputs in place so a context-overflow retry can fit."""
++    n_tool = 0
++    for i in range(len(messages) - 1, -1, -1):
++        if messages[i].get("role") == "tool":
++            n_tool += 1
++            if n_tool > keep_last:
++                c = messages[i].get("content")
++                if isinstance(c, str) and len(c) > 400:
++                    messages[i]["content"] = c[:300] + "...[older output trimmed]"
++
++
++async def call_model(model, messages, tools):
++    """model.chat with retries for transient provider failures."""
++    attempt = 0
++    while True:
++        try:
++            return await model.chat(messages, tools=tools)
++        except asyncio.CancelledError:
++            raise
++        except Exception as exc:
++            attempt += 1
++            text = ("%s: %s" % (type(exc).__name__, exc)).lower()
++            if _is_context_error(text) and attempt <= 3:
++                _shrink_history(messages)
++                continue
++            transient = isinstance(exc, json.JSONDecodeError) or any(
++                s in text for s in ("generationcutoff", "cutoff", "timeout", "timed out",
++                                    "rate limit", "429", "502", "503", "504", "overloaded",
++                                    "connection", "reset by peer", "temporarily",
++                                    "unavailable", "incomplete", "eof"))
++            if not transient or attempt >= 3:
++                raise
++            await asyncio.sleep(min(20.0, 3.0 * attempt))
+ 
+ 
+ async def run(instruction, model, world):
+-    messages = [
+-        {"role": "system", "content": SYSTEM_PROMPT},
+-        {"role": "user", "content": instruction},
+-    ]
++    t0 = time.monotonic()
++    servers = parse_mcp_servers(instruction)
++    mcp_tools, mcp_notes = (await setup_mcp(world, servers) if servers else ([], []))
++
++    system = SYSTEM_PROMPT
++    if mcp_notes:
++        system += ("\n\nMCP status: " + " ".join(mcp_notes)
++                   + "\nIf the task depends on these servers, connect to them yourself via"
++                     " bash; the task text names their endpoints and transports.")
++    mcp_by_name = {t["tool_name"]: t for t in mcp_tools}
++    tools = [BASH_TOOL] + [
++        {"type": "function", "function": {"name": t["tool_name"], "description": t["description"],
++                                          "parameters": t["parameters"]}} for t in mcp_tools]
++
++    messages = [{"role": "system", "content": system}, {"role": "user", "content": instruction}]
++    repeat = {"key": None, "count": 0}
+     while True:
+-        reply = await model.chat(messages, tools=TOOLS)
++        reply = await call_model(model, messages, tools)
+         messages.append(reply.message)
+         if not reply.tool_calls:
+             return
+         for call in reply.tool_calls:
++            args = call.arguments if isinstance(call.arguments, dict) else {}
+             if call.name == "bash":
+-                r = await world.exec(str(call.arguments.get("command", "")))
+-                parts = [r.stdout]
+-                if r.stderr:
+-                    parts.append("[stderr]\n" + r.stderr)
+-                parts.append(f"[exit {r.return_code}]")
+-                output = "\n".join(p for p in parts if p)
++                out = await exec_bash(world, args)
++            elif call.name in mcp_by_name:
++                out = await call_mcp(world, mcp_by_name[call.name], args)
+             else:
+-                output = f"unknown tool: {call.name}"
+-            messages.append(
+-                {"role": "tool", "tool_call_id": call.id, "content": output}
+-            )
++                out = "unknown tool %r; available: bash, MCP tools: %s" % (
++                    call.name, ", ".join(sorted(mcp_by_name)) or "none")
++            out = clip_output(out)
++            key = (call.name, json.dumps(args, sort_keys=True, ensure_ascii=True)[:400], out[:400])
++            repeat["count"] = repeat["count"] + 1 if key == repeat["key"] else 1
++            repeat["key"] = key
++            if repeat["count"] >= 3:
++                out += ("\n[loop guard] This call and its result are nearly identical to the"
++                        " previous %d. If you are polling for a change, poll differently (or"
++                        " wait first); otherwise stop repeating: change something in how you"
++                        " attack this, or finish the task." % repeat["count"])
++            messages.append({"role": "tool", "tool_call_id": call.id,
++                             "content": out + "\n" + time_tag(t0)})
+--- /dev/null
++++ iteration01/mcp_bridge.py
+@@ -0,0 +1,214 @@
++"""Minimal MCP client bridge (stdlib only). Runs INSIDE the task container; the
++agent harness writes it there and invokes it so the task's MCP servers can be
++exposed to the model as ordinary tools. Supports the streamable-HTTP transport
++and, as a fallback, stdio.
++
++Output discipline: exactly one line on stdout, a JSON object, ASCII-escaped so
++no encoding can mangle it in transit: {"ok": true, ...} or
++{"ok": false, "error": "..."}. Exit status is 0 even on tool errors (the error
++is data for the caller); 2 only for malformed CLI usage. Long strings are
++truncated so one result cannot flood the agent's context.
++"""
++
++import argparse
++import json
++import select
++import subprocess
++import sys
++import time
++import urllib.request
++
++MAX_STR = 60000
++LIST_RETRIES = 3
++CALL_RETRIES = 2
++
++
++def emit(obj):
++    sys.stdout.write(json.dumps(obj, ensure_ascii=True) + "\n")
++    sys.stdout.flush()
++
++
++def clamp(value):
++    """Recursively cap string length so a huge blob cannot flood the context."""
++    if isinstance(value, str) and len(value) > MAX_STR:
++        return value[:MAX_STR] + "...[truncated %d chars]" % (len(value) - MAX_STR)
++    if isinstance(value, list):
++        return [clamp(v) for v in value]
++    if isinstance(value, dict):
++        return {k: clamp(v) for k, v in value.items()}
++    return value
++
++
++class HttpConn:
++    """JSON-RPC over MCP streamable HTTP (POST only; sessions via header)."""
++
++    def __init__(self, url, timeout):
++        self.url = url
++        self.timeout = timeout
++        self.session = None
++        self.next_id = 0
++
++    def rpc(self, method, params=None, notify=False, retries=LIST_RETRIES):
++        self.next_id += 1
++        payload = {"jsonrpc": "2.0", "method": method}
++        if not notify:
++            payload["id"] = self.next_id
++        if params is not None:
++            payload["params"] = params
++        last = "no response"
++        for attempt in range(max(1, retries)):
++            try:
++                req = urllib.request.Request(
++                    self.url, data=json.dumps(payload).encode("utf-8"), method="POST")
++                req.add_header("Content-Type", "application/json")
++                req.add_header("Accept", "application/json, text/event-stream")
++                if self.session:
++                    req.add_header("mcp-session-id", self.session)
++                resp = urllib.request.urlopen(req, timeout=self.timeout)
++                self.session = resp.headers.get("mcp-session-id") or self.session
++                raw = resp.read().decode("utf-8", "replace")
++                ctype = resp.headers.get("Content-Type") or ""
++                if "text/event-stream" in ctype:  # last parseable data: line
++                    for sse_line in raw.splitlines():
++                        sse_line = sse_line.strip()
++                        if sse_line.startswith("data:"):
++                            try:
++                                data = json.loads(sse_line[5:].strip())
++                            except Exception:
++                                pass
++                else:
++                    data = json.loads(raw) if raw.strip() else None
++                if data is not None:
++                    if isinstance(data, dict) and data.get("error"):
++                        return {"ok": False, "error": data["error"]}
++                    return {"ok": True, "result": data.get("result")}
++                if notify:
++                    return {"ok": True, "result": None}
++                last = "empty response (http status %s)" % getattr(resp, "status", "?")
++            except Exception as exc:
++                last = "%s: %s" % (type(exc).__name__, exc)
++            if attempt + 1 < max(1, retries):
++                time.sleep(1.5 * (attempt + 1))
++        return {"ok": False, "error": last}
++
++
++class StdioConn:
++    """JSON-RPC over a child process's stdin/stdout (newline-delimited)."""
++
++    def __init__(self, command, timeout):
++        self.proc = subprocess.Popen(
++            command, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
++            stderr=subprocess.DEVNULL, text=True, bufsize=1)
++        self.timeout = timeout
++        self.next_id = 0
++
++    def _read(self, want_id, deadline):
++        while time.time() < deadline:
++            ready, _, _ = select.select([self.proc.stdout], [], [],
++                                        max(0.05, deadline - time.time()))
++            if not ready:
++                if self.proc.poll() is not None:
++                    return None
++                continue
++            line = self.proc.stdout.readline()
++            if not line:
++                return None
++            try:
++                msg = json.loads(line.strip())
++            except Exception:
++                continue
++            if isinstance(msg, dict) and msg.get("id") == want_id:
++                return msg
++        return None
++
++    def rpc(self, method, params=None, notify=False, retries=1):
++        if self.proc.poll() is not None:
++            return {"ok": False, "error": "server process already exited"}
++        self.next_id += 1
++        payload = {"jsonrpc": "2.0", "method": method}
++        if not notify:
++            payload["id"] = self.next_id
++        if params is not None:
++            payload["params"] = params
++        try:
++            self.proc.stdin.write(json.dumps(payload) + "\n")
++            self.proc.stdin.flush()
++        except Exception as exc:
++            return {"ok": False, "error": "%s: %s" % (type(exc).__name__, exc)}
++        if notify:
++            return {"ok": True, "result": None}
++        msg = self._read(self.next_id, time.time() + self.timeout)
++        if msg is None:
++            return {"ok": False, "error": "no response before timeout"}
++        if msg.get("error"):
++            return {"ok": False, "error": msg["error"]}
++        return {"ok": True, "result": msg.get("result")}
++
++
++def handshake(conn):
++    r = conn.rpc("initialize", {
++        "protocolVersion": "2024-11-05", "capabilities": {},
++        "clientInfo": {"name": "harness-mcp-bridge", "version": "1.0"}})
++    if not r.get("ok"):
++        return r
++    conn.rpc("notifications/initialized", {}, notify=True)
++    return r
++
++
++def main():
++    parser = argparse.ArgumentParser()
++    sub = parser.add_subparsers(dest="cmd", required=True)
++    for name, default_timeout in (("list", 120.0), ("call", 600.0)):
++        sp = sub.add_parser(name)
++        group = sp.add_mutually_exclusive_group(required=True)
++        group.add_argument("--url")
++        group.add_argument("--stdio", nargs="+", metavar="ARG")
++        sp.add_argument("--timeout", type=float, default=default_timeout)
++        if name == "call":
++            sp.add_argument("--name", required=True)
++            sp.add_argument("--args", default="{}")
++
++    a = parser.parse_args()
++    try:
++        args = json.loads(getattr(a, "args", None) or "{}")
++    except Exception as exc:
++        emit({"ok": False, "error": "invalid --args JSON: %s" % exc})
++        return 0
++
++    conn = StdioConn(a.stdio, a.timeout) if a.stdio else HttpConn(a.url, a.timeout)
++    r = handshake(conn)
++    if not r.get("ok"):
++        emit({"ok": False, "error": "initialize failed: %s" % r.get("error")})
++        return 0
++
++    if a.cmd == "list":
++        tools, cursor = [], None
++        for _ in range(30):
++            r = conn.rpc("tools/list", {} if not cursor else {"cursor": cursor})
++            if not r.get("ok"):
++                emit({"ok": False, "error": "tools/list failed: %s" % r.get("error")})
++                return 0
++            result = r.get("result") or {}
++            tools.extend(result.get("tools") or [])
++            cursor = result.get("nextCursor")
++            if not cursor:
++                break
++        emit({"ok": True, "tools": [
++            {"name": t.get("name"), "description": (t.get("description") or "")[:4000],
++             "inputSchema": t.get("inputSchema") or {"type": "object", "properties": {}}}
++            for t in tools if t.get("name")]})
++        return 0
++
++    r = conn.rpc("tools/call", {"name": a.name, "arguments": args}, retries=CALL_RETRIES)
++    if not r.get("ok"):
++        emit({"ok": False, "error": r.get("error")})
++        return 0
++    result = r.get("result") or {}
++    emit({"ok": True, "isError": bool(result.get("isError")),
++          "content": clamp(result.get("content") or []),
++          "structuredContent": clamp(result.get("structuredContent"))})
++    return 0
++
++
++if __name__ == "__main__":
++    sys.exit(main())

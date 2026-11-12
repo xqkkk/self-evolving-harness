@@ -1,0 +1,4 @@
+terminal-bench/regex-log
+terminal-bench/kv-store-grpc
+terminal-bench/llm-inference-batching-scheduler
+terminal-bench/schemelike-metacircular-eval

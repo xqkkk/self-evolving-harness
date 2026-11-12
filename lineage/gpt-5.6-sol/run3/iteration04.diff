@@ -1,0 +1,115 @@
+--- iteration03/harness.py
++++ iteration04/harness.py
+@@ -12,6 +12,7 @@
+ Operating method:
+ - First identify the required deliverables, constraints, and likely acceptance checks. Inspect the environment and relevant inputs before choosing an implementation.
+ - Work from evidence. Check file formats, dimensions, units, interfaces, and existing project conventions rather than guessing. For repository changes, trace the call path and read nearby tests and analogous implementations before editing.
++- For search, ranking, allocation, or filtering work, make the objective and tie-breakers explicit. Enumerate the complete eligible candidate set before changing state; distinguish constraints from preferences and "maximize count" from "maximize value". Compute and sanity-check the intended selection before executing it.
+ - Make focused changes, then validate them with the strongest affordable checks. Exercise edge cases implied by the request and independently inspect final artifacts. Do not modify tests or evaluation machinery.
+ - Budget the run. Prioritize a correct deliverable over exhaustive exploration. Bound commands that may wait on services, searches, builds, or training; redirect noisy output to files and inspect selected portions. Use the bash timeout_s argument explicitly for genuinely long jobs. Never allow one diagnostic probe to consume the whole task.
+ - Bash output is clipped when very large. Use targeted grep/find, sed ranges, summaries, or redirect output to a file instead of dumping entire trees, generated files, binaries, or logs.
+@@ -78,19 +79,27 @@
+ 
+ 
+ def compact_history(messages: list[dict], *, aggressive: bool = False) -> None:
+-    """Bound old observations while preserving tool-call/result protocol pairs."""
++    """Bound history only when needed, preserving evidence on ordinary runs.
++
++    Earlier versions shortened every observation as soon as seven newer tools had
++    run. That saved tokens but silently discarded candidate records, test failures,
++    and user constraints even when the request was nowhere near the context limit.
++    Reasoning envelopes are cheap to remove; authoritative tool results are retained
++    until the whole visible history actually crosses the budget.
++    """
+     assistant_indexes = [i for i, m in enumerate(messages) if m.get("role") == "assistant"]
+     keep_assistant = 3 if aggressive else 8
+     for i in assistant_indexes[:-keep_assistant]:
+-        # Responses API reasoning items can be large. The ordinary content and
+-        # tool_calls fields are sufficient to reconstruct old turns.
++        # The ordinary content and tool_calls fields preserve protocol continuity.
+         messages[i].pop("_responses_items", None)
+ 
++    if not aggressive and _message_chars(messages) <= CONTEXT_CHAR_TARGET:
++        return
++
+     tool_indexes = [i for i, m in enumerate(messages) if m.get("role") == "tool"]
+-    keep_tools = 3 if aggressive else 7
+-    old = tool_indexes[:-keep_tools]
++    keep_tools = 3 if aggressive else 8
+     old_limit = 900 if aggressive else 3000
+-    for i in old:
++    for i in tool_indexes[:-keep_tools]:
+         content = str(messages[i].get("content") or "")
+         if len(content) > old_limit:
+             half = old_limit // 2
+@@ -100,15 +109,18 @@
+                 + content[-half:]
+             )
+ 
+-    # A long initial policy plus several medium results can still exceed the target.
+-    if not aggressive and _message_chars(messages) > CONTEXT_CHAR_TARGET:
+-        for i in tool_indexes[:-4]:
++    # Tighten only as many older observations as necessary to reach the target.
++    # Two most-recent results remain exact even in the worst case (each individual
++    # result is separately clipped), preserving current-state evidence.
++    if _message_chars(messages) > CONTEXT_CHAR_TARGET:
++        for i in tool_indexes[:-2]:
+             content = str(messages[i].get("content") or "")
+             if len(content) > 1200:
+                 messages[i]["content"] = (
+                     content[:550] + "\n[... old observation compacted ...]\n" + content[-550:]
+                 )
+-
++            if _message_chars(messages) <= CONTEXT_CHAR_TARGET:
++                break
+ 
+ def _looks_like_context_error(exc: Exception) -> bool:
+     text = str(exc).lower()
+@@ -150,7 +162,8 @@
+ - Start by using the application tools rather than merely announcing a plan. Follow any required conversation or workflow entry point exactly once.
+ - Read every result and notification as authoritative new state. In an interactive workflow, a returned user message is a new turn: reconcile it with the outstanding request, do not invent a response, and do not end while a material goal remains unresolved.
+ - Before acting, extract the user's exact scope, constraints, ordering, and any required deadline. If a notification or later message changes them, revise the plan instead of completing a stale action.
+-- Prefer narrow searches, filters, and pagination over fetching entire collections. Establish exact records and current state before changing anything. If a result says it was clipped, narrow or paginate rather than assuming omitted records are irrelevant.
++- Prefer narrow searches, filters, and pagination over fetching entire collections. Establish exact records and current state before changing anything. For multi-record selection, finish discovery, deduplicate and compare candidates against explicit criteria before mutating state. If a result says it was clipped, narrow or paginate rather than assuming omitted records are irrelevant.
++- Keep the user's requested scope separate from optional adjacent work. Do not turn a suggestion into authorization, and do not claim a prerequisite, success, or final state that a tool result did not establish.
+ - Do not call environment configuration, benchmark-control, seed, runtime, or evaluation utilities unless the user's requested task itself is to administer them.
+ - Before a consequential action, check identity, parameters, prerequisites, authorization, and whether ambiguity or confirmation remains. After it, verify the returned status before proceeding. Never batch consequential calls that depend on one another.
+ - For simulated-time requests, use the authoritative clock, compute the requested boundary, and re-check state after waiting; do not substitute wall-clock time or an approximate number of polling calls.
+@@ -228,17 +241,26 @@
+             # an extra turn there can repeat a committed action or violate a stop protocol.
+             if not mcp_schemas and used_bash and not completion_audit_requested:
+                 completion_audit_requested = True
+-                messages.append({
+-                    "role": "user",
+-                    "content": (
+-                        "Before finalizing, perform one strict completion audit against the "
+-                        "original request. Compare each observable requirement with the actual "
+-                        "artifact, computation, evidence, or diff as applicable; inspect for "
+-                        "unintended changes, and run the strongest "
+-                        "focused check still affordable. Fix only concrete gaps you find; do not "
+-                        "broaden a correct solution merely to make changes. Then give the final response."
+-                    ),
+-                })
++                # Start a clean reviewer context rather than asking the implementer to
++                # confirm its own conclusions. The reviewer has the original contract,
++                # the candidate report, and direct access to the same workspace.
++                candidate = reply.text or "(The implementation pass returned no report.)"
++                messages = [
++                    {
++                        "role": "system",
++                        "content": SYSTEM_PROMPT + """
++
++You are now the independent completion reviewer. Treat the existing workspace as a candidate solution, not as proof that the request is satisfied. Re-derive the observable requirements from the original request, inspect the actual artifact or diff, and test the highest-risk behavior. Look especially for omitted edge cases, false success claims, unintended files, and tests that do not exercise the requested behavior. Fix only concrete defects you can substantiate; do not redesign a correct solution or edit evaluation machinery. Finish with an accurate final report.""",
++                    },
++                    {
++                        "role": "user",
++                        "content": (
++                            "ORIGINAL REQUEST:\n" + instruction
++                            + "\n\nCANDIDATE IMPLEMENTER REPORT:\n" + candidate
++                            + "\n\nIndependently audit and, if necessary, complete the work now."
++                        ),
++                    },
++                ]
+                 continue
+             return
+ 

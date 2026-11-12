@@ -1,0 +1,185 @@
+--- iteration01/harness.py
++++ iteration02/harness.py
+@@ -1,5 +1,6 @@
+ """General-purpose autonomous tool harness."""
+ 
++import asyncio
+ import json
+ 
+ from .mcp_bridge import MCPBridge
+@@ -9,11 +10,12 @@
+ You have a shell and may also have task-specific MCP tools. Use MCP tools directly when supplied; do not hand-implement their HTTP protocol. Use the shell to inspect the environment, read ordinary documentation/source, edit files, run programs, and test the result. Never obtain an answer from an upstream solution, hidden tests, evaluation artifacts, dataset answer copies, or internet searches; solve it yourself.
+ 
+ Work method:
+-1. Parse the deliverable, constraints, exact output location/format, and success criteria. Inspect the relevant files and environment before acting. Do not assume tools such as rg, jq, or a particular test runner are installed.
++1. Parse the deliverable, constraints, exact output location/format, and success criteria into a concrete checklist; keep track of pending parts until the final audit. Inspect the relevant files and environment before acting. Do not assume tools such as rg, jq, or a particular test runner are installed.
+ 2. Form a short evidence-based plan, then execute it. Prefer narrow searches and bounded output. Exclude generated, minified, dependency, and build directories unless they are genuinely relevant. Redirect potentially large output to a file and inspect selected ranges or summaries. Put explicit timeouts around commands that might hang.
+-3. Validate independently before finishing. Check required artifacts exist and match the requested format. For code, understand surrounding conventions and tests, fix the root cause rather than a one-off example, consider boundary/error cases, run focused tests and then the broadest practical checks, and review the final diff. Do not weaken tests or unrelated behavior.
+-4. For document/data questions, distinguish definitions, period/date, units, signs, percent versus decimal, and revised versus earlier values. Inspect table headings, row/column alignment and footnotes; compare later sources when revisions matter; calculate with a script; then re-read the cited source context as an independent check.
+-5. For interactive scenarios, obey the supplied policy and protocol exactly, inspect notifications and tool errors, confirm state after consequential actions, and do not claim success prematurely. Ask the user only when genuinely necessary or required by policy.
++3. Validate independently before finishing. Check required artifacts exist and match the requested format. For code, understand surrounding conventions and tests, fix the root cause rather than a one-off example, consider boundary/error cases, run focused tests and then the broadest practical checks, and review the final diff. A newly failing existing test is evidence of a compatibility bug: fix it rather than excluding it or declaring it obsolete. Do not weaken tests or unrelated behavior.
++4. For document/data questions, distinguish exact definitions, populations, period/date, units, signs, totals versus components, and percent versus decimal. Inspect table titles, headings, row/column alignment and footnotes; when revisions matter, find the latest source that reports the requested period and verify that later sources did not revise it. State the observations and formula, calculate with a script, and re-read the source context as an independent check. Do not silently substitute a similar metric.
++5. For interactive scenarios, treat the requested action and its stopping point literally; do not extend a preparatory or informational request into a downstream committing operation. Capture the initial state when relevant, inspect every notification and tool error, honor temporal cutoffs, and verify final state after consequential actions. After a timeout or transport failure, inspect state before replaying any call that may already have committed. Do not announce completion before waits or follow-up events are resolved, and do not send an unrequested user-facing update. If the protocol requires an initial tool call, make it before conversational text; a readiness statement is not completion.
++6. Manage the task's time as a resource. Sample or benchmark potentially expensive work before scaling it, prefer batching or parallelism over long serial loops, set realistic command timeouts, and preserve enough time for validation and the required artifact. If one approach is too slow or repeatedly fails, diagnose once and switch strategies rather than retrying blindly.
+ 
+ Tool output shown to you may be abbreviated when it is very large; the full command still ran. If that happens, rerun a targeted query or save and inspect the relevant slice. Preserve user work. Keep going until the result is verified, then give a concise final response and make no further tool calls."""
+ 
+@@ -80,6 +82,26 @@
+         messages.append({"role":"system", "content":"\n".join(errors)})
+     tools = [BASH_TOOL, *mcp_tools]
+ 
++    mcp_calls = 0
++    tool_nudge_used = False
++
++    async def execute(call):
++        if call.name == "bash":
++            command = str(call.arguments.get("command", ""))
++            timeout = call.arguments.get("timeout_s")
++            try:
++                r = await world.exec(command, timeout_s=timeout)
++                parts = [r.stdout]
++                if r.stderr:
++                    parts.append("[stderr]\n" + r.stderr)
++                parts.append(f"[exit {r.return_code}]")
++                return "\n".join(p for p in parts if p)
++            except Exception as exc:
++                return f"tool execution error: {type(exc).__name__}: {exc}"
++        if call.name in bridge.routes:
++            return await bridge.call(call.name, call.arguments)
++        return f"unknown tool: {call.name}"
++
+     while True:
+         _compact(messages)
+         try:
+@@ -91,24 +113,29 @@
+             reply = await model.chat(messages, tools=tools)
+         messages.append(reply.message)
+         if not reply.tool_calls:
++            # MCP-backed tasks cannot normally be completed without touching the
++            # advertised service.  Give a premature prose-only answer one chance
++            # to self-correct, rather than silently ending the run.
++            if mcp_tools and not mcp_calls and not tool_nudge_used:
++                tool_nudge_used = True
++                messages.append({
++                    "role": "system",
++                    "content": (
++                        "No MCP operation has been performed yet. Re-check the task "
++                        "protocol. If it requires an initial or other MCP call, make "
++                        "that call now instead of merely acknowledging the task."
++                    ),
++                })
++                continue
+             return
+-        for call in reply.tool_calls:
+-            if call.name == "bash":
+-                command = str(call.arguments.get("command", ""))
+-                timeout = call.arguments.get("timeout_s")
+-                try:
+-                    r = await world.exec(command, timeout_s=timeout)
+-                    parts = [r.stdout]
+-                    if r.stderr:
+-                        parts.append("[stderr]\n" + r.stderr)
+-                    parts.append(f"[exit {r.return_code}]")
+-                    output = "\n".join(p for p in parts if p)
+-                except Exception as exc:
+-                    output = f"tool execution error: {type(exc).__name__}: {exc}"
+-            elif call.name in bridge.routes:
+-                output = await bridge.call(call.name, call.arguments)
+-            else:
+-                output = f"unknown tool: {call.name}"
++
++        mcp_calls += sum(call.name in bridge.routes for call in reply.tool_calls)
++        # Tool calls emitted in one assistant message are independent by API
++        # contract.  Execute them concurrently, then preserve their original
++        # order in the transcript.  This matters for searches and test shards
++        # that would otherwise spend most of the task budget waiting serially.
++        outputs = await asyncio.gather(*(execute(call) for call in reply.tool_calls))
++        for call, output in zip(reply.tool_calls, outputs):
+             messages.append({
+                 "role":"tool", "tool_call_id":call.id,
+                 "content":_abbreviate(output),
+--- iteration01/mcp_bridge.py
++++ iteration02/mcp_bridge.py
+@@ -6,6 +6,7 @@
+ """
+ 
+ import base64
++import itertools
+ import json
+ import re
+ import shlex
+@@ -17,14 +18,18 @@
+ url, mode = sys.argv[1], sys.argv[2]
+ sid = None if sys.argv[3] == "-" else sys.argv[3]
+ payload = json.loads(sys.argv[4])
++rpc_id = int(sys.argv[5])
+ 
+ def post(obj, want=True):
+     global sid
+     data = json.dumps(obj, separators=(",", ":")).encode()
+     h = {"Content-Type":"application/json", "Accept":"application/json, text/event-stream"}
+     if sid: h["Mcp-Session-Id"] = sid
++    if mode != "init": h["MCP-Protocol-Version"] = "2025-03-26"
+     req = urllib.request.Request(url, data=data, headers=h, method="POST")
+-    with urllib.request.urlopen(req, timeout=300) as r:
++    # This is an idle socket timeout, not a wall-clock limit. SSE keepalives can
++    # legitimately arrive while a remote operation performs slow model work.
++    with urllib.request.urlopen(req, timeout=900) as r:
+         sid = r.headers.get("Mcp-Session-Id", sid)
+         if not want:
+             return None
+@@ -51,7 +56,7 @@
+         tools = post({"jsonrpc":"2.0", "id":2, "method":"tools/list", "params":{}})
+         print(json.dumps({"ok":True, "session":sid, "initialize":ans, "tools":tools}))
+     else:
+-        ans = post({"jsonrpc":"2.0", "id":3, "method":"tools/call", "params":payload})
++        ans = post({"jsonrpc":"2.0", "id":rpc_id, "method":"tools/call", "params":payload})
+         print(json.dumps({"ok":True, "response":ans}))
+ except Exception as e:
+     print(json.dumps({"ok":False, "error":type(e).__name__+": "+str(e)}))
+@@ -69,6 +74,7 @@
+         self.servers = {}
+         self.routes = {}
+         self._path = "/tmp/agent_harness_mcp.py"
++        self._ids = itertools.count(100)
+ 
+     async def discover(self, instruction):
+         """Initialize declared HTTP servers and return OpenAI-format tools."""
+@@ -85,7 +91,7 @@
+         errors = []
+         for server_name, url in declarations:
+             payload = json.dumps({})
+-            cmd = self._command(url, "init", "-", payload)
++            cmd = self._command(url, "init", "-", payload, 0)
+             try:
+                 out = await self.world.exec(cmd, timeout_s=330)
+                 data = self._last_json(out.stdout)
+@@ -125,8 +131,8 @@
+             }})
+         return tools, errors
+ 
+-    def _command(self, url, mode, sid, payload):
+-        args = ["python3", self._path, url, mode, sid or "-", payload]
++    def _command(self, url, mode, sid, payload, rpc_id):
++        args = ["python3", self._path, url, mode, sid or "-", payload, rpc_id]
+         return " ".join(shlex.quote(str(x)) for x in args)
+ 
+     @staticmethod
+@@ -147,9 +153,16 @@
+             separators=(",", ":"), ensure_ascii=False,
+         )
+         try:
++            # A tool may itself wait on a human or model.  The former 330s cap
++            # repeatedly cancelled valid long-lived calls; allow one bounded
++            # wait instead of encouraging ambiguous retries of side effects.
+             out = await self.world.exec(
+-                self._command(url, "call", sid, payload), timeout_s=330
++                self._command(url, "call", sid, payload, next(self._ids)),
++                timeout_s=930,
+             )
++            if out.return_code:
++                detail = (out.stderr or out.stdout or "no diagnostic output").strip()
++                return f"MCP transport process exited {out.return_code}: {detail[-1000:]}"
+             data = self._last_json(out.stdout)
+             if not data.get("ok"):
+                 return "MCP transport error: " + str(data.get("error"))

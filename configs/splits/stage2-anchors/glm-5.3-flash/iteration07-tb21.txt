@@ -1,0 +1,4 @@
+terminal-bench/openssl-selfsigned-cert
+terminal-bench/pypi-server
+terminal-bench/financial-document-processor
+terminal-bench/sam-cell-seg

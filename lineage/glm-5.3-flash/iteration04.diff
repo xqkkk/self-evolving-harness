@@ -1,0 +1,244 @@
+--- iteration03/harness.py
++++ iteration04/harness.py
+@@ -37,6 +37,19 @@
+ MCP_NOTE_HEADER = "MCP servers reachable from inside the task container:"
+ EXEC_TIMEOUT_S = 1800.0          # one command must not be able to eat the run
+ COMPACT_AT_CHARS = 480_000       # ~140k tokens; leave headroom under the 258k cap
++WATCHDOG_S = 990.0               # per model call: a successful generation can need at most
++                                 # 3 gateway samples (~300 s each); past this it is dead and
++                                 # only the run's own timeout would notice
++FIRST_CALL_WATCHDOG_S = 420.0    # before any tool call has landed there is nothing to
++                                 # protect: a hung orientation call would eat a whole short
++                                 # budget (observed: a 15-min run died inside call #1), while
++                                 # successful first calls never exceeded ~5.5 min in 60 trials
++
++
++class _WatchdogTimeout(Exception):
++    """One model call produced nothing within WATCHDOG_S - longer than any
++    successful generation could still take - so the attempt is dead. Without
++    this, a hung call burns the rest of the run silently."""
+ 
+ BASH_TOOL = {"type": "function", "function": {
+     "name": "bash",
+@@ -60,7 +73,7 @@
+ 7. When the task asks a question, make your final message state the exact answer plainly - the precise value, name, or phrase requested - not just reasoning around it.
+ 8. Deliver through the environment's own channels: if the task provides tools for sending messages, submitting, saving, or terminating (or names a required file or channel), perform those acts with those tools; a plain-text reply reaches no one and simply ends the run. If a requirement is genuinely ambiguous and you can ask the user a question, ask one concise question early; otherwise proceed on the most conservative reading and state your assumption. Before finishing, check whether the instructions define an ending protocol (a stop token, or an end/terminate/submit call) and perform it.
+ 
+-Each tool result is clipped if very long (a marker shows what was dropped) and ends with the run's elapsed wall-clock time. Use that to pace yourself: your total budget is unknown and varies by task, so earn margin early - front-load the inventory, treat long installs, builds, or training runs as the wrong trade, and keep the deliverable present and valid in its required location from the first minutes so the run could end cleanly at any moment. As elapsed time grows, shift from exploring to finishing and verifying. Keep reasoning bursts short: prefer a small tool call now over long uninterrupted deliberation - you learn more per token from a tool result than from speculation, and very long single calls waste wall clock and can be cut off.
++Each tool result is clipped if very long (a marker shows what was dropped) and ends with the run's elapsed wall-clock time. Use that to pace yourself: your total budget is unknown and varies by task, so earn margin early - front-load the inventory, treat long installs, builds, or training runs as the wrong trade, and keep the deliverable present and valid in its required location from the first minutes so the run could end cleanly at any moment. As elapsed time grows, shift from exploring to finishing and verifying. Keep reasoning bursts short: prefer a small tool call now over long uninterrupted deliberation - you learn more per token from a tool result than from speculation, and very long single calls waste wall clock and can be cut off. If a reply of yours is ever cut off, or a single call runs many minutes, treat that as a signal to shrink every later reply to one small action and to move computation into scripts the machine runs instead of working it out in your head.
+ 
+ Keep each individual reply compact: a reply that runs very long can be cut off by the gateway before it completes, losing everything in it. Produce large content in several smaller tool calls (for example append to a file in chunks) rather than one enormous block, and summarize results instead of echoing bulk output back.
+ 
+@@ -108,11 +121,13 @@
+ # budget is unknown (and varies per task), so these never claim a limit; they
+ # just keep the model converging and its deliverable valid on disk.
+ PACE_STEPS = (
+-    (6, "Checkpoint: if the deliverable exists in any form, make sure it is saved in its required location now."),
++    (6, "Checkpoint: the deliverable must exist in its required location right now - if it does"
++        " not exist yet, write a provisional version now (marked provisional) and refine it later."),
+     (12, "Shift weight from exploring to finishing; keep the deliverable valid on disk from here on."),
+-    (20, "Prefer completing and verifying exactly what was asked over broadening the work."),
+-    (32, "A lot of time has gone by: finish the remaining essentials, verify the deliverable in its final place, and end the run cleanly."),
+-    (48, "Wrap up now: finalize, verify, and finish rather than start anything new."),
++    (18, "Prefer completing and verifying exactly what was asked over broadening the work."),
++    (26, "A lot of time has gone by: finish the remaining essentials, verify the deliverable in its"
++         " final place, and end the run cleanly."),
++    (40, "Wrap up now: finalize, verify, and finish rather than start anything new."),
+ )
+ 
+ 
+@@ -124,8 +139,8 @@
+         if m >= threshold and threshold not in state:
+             state[threshold] = True
+             return " [harness pace] " + text
+-    if m >= 48 and m - state.get("_last_firm", -12.0) >= 12.0:
+-        state[48] = True
++    if m >= 40 and m - state.get("_last_firm", -12.0) >= 12.0:
++        state[40] = True
+         state["_last_firm"] = m
+         return " [harness pace] " + PACE_STEPS[-1][1]
+     return ""
+@@ -172,6 +187,21 @@
+             listing + " If and only if no such tool exists here, reply with the"
+             " same final answer.")
+ 
++# A bare reply that stops mid-sentence was cut off before it finished; it is not
++# a final answer and not a delivery question - whatever it was about to do next
++# simply never happened. One nudge to continue beats ending the run there.
++TRUNCATED_NOTE = (
++    "[harness] Your previous reply stops mid-sentence: it was cut off before you"
++    " finished, so whatever it was about to do or say never happened. Continue from"
++    " exactly where it stopped - do not restart or re-summarize. If the task is in"
++    " fact already complete, reply with the short final answer and no tool call.")
++
++
++def _looks_truncated(text):
++    t = (text or "").rstrip()
++    return len(t) >= 40 and (t[-1].isalnum() or t[-1] in ",;:-")
++
++
+ def _last_json(text):
+     for line in reversed((text or "").splitlines()):
+         if line.strip().startswith("{"):
+@@ -327,36 +357,57 @@
+ 
+ def _is_cutoff(text):
+     return ("generationcutoff" in text or "generation limit" in text
+-            or "cut at" in text)
++            or "cut at" in text or "watchdogtimeout" in text)
+ 
+ 
+ CUTOFF_NOTES = (
+-    "[harness] Your previous reply was cut off by the gateway before it finished"
+-    " (too long), so it never reached the tool layer. This reply must be much"
+-    " shorter: prefer one concise tool call over prose, split large content"
+-    " across several calls, and never emit a whole file in one response when"
+-    " writing it in appends would do.",
+-    "[harness] A second reply was also cut off. Reply with the single smallest"
+-    " useful next tool call - or, if the task is done, a one-paragraph final"
+-    " answer - and nothing else.",
++    "[harness] Your previous generation never arrived: the gateway cut every sample of it"
++    " (each attempt is cut at ~5 minutes), so the tool layer received nothing. This reply"
++    " must be tiny: the single smallest useful next tool call and nothing else. If the step"
++    " needs computation, write a short script and run it instead of working it out in your"
++    " reply.",
++    "[harness] Another generation was lost the same way. Reply with one short tool call -"
++    " or, if the task is done, one short sentence - and no prose.",
+ )
+ 
+-
+-async def call_model(model, messages, tools):
++# Once generations start being cut off (or succeeding only after ~15 min of
++# sampling), that property holds for the rest of the run - so unlike the one-shot
++# retry notes above, the adaptation is persistent: it rides on every tool result
++# and survives compaction because fresh results keep carrying it.
++STALL_NOTE = (" [harness stall-watch] Generations on this run are being cut off or sampled for"
++              " many minutes (the gateway cuts each attempt at ~5 min and re-samples up to 3x,"
++              " so one oversized reply can cost ~15 min even when it eventually gets through)."
++              " From here on keep every reply to one small tool call; do nontrivial computation"
++              " by writing a short script and running it, never by working it out in your reply.")
++
++
++async def call_model(model, messages, tools, state):
+     """model.chat with retries for transient provider failures.
+ 
+-    Generation cut-offs are handled separately from ordinary transient errors:
+-    each costs minutes of gateway sampling, so resending the identical request
+-    is capped at one retry per stage, and each retry first shrinks the history
+-    and injects a brevity demand. Injected notes are dropped again once a reply
+-    gets through, so they do not shape the rest of the run.
++    Every call sits under a workspace watchdog: a hung call would otherwise
++    burn the rest of the run silently (the kernel's own timeout is longer).
++    Generation cut-offs and watchdog kills are handled separately from
++    ordinary transient errors: each costs minutes of gateway sampling, so the
++    retry count is capped, and each retry first shrinks the history and
++    injects a short behavioral demand as a user message. Injected notes are
++    dropped again once a reply gets through, so they do not shape later turns;
++    the persistent ``state["stalled"]`` note takes over that role instead.
+     """
+     attempt = 0
+     cutoffs = 0
+     injected = []
+     while True:
+         try:
+-            reply = await model.chat(messages, tools=tools)
++            started = time.monotonic()
++            wd = WATCHDOG_S if state.get("tool_calls") else FIRST_CALL_WATCHDOG_S
++            try:
++                reply = await asyncio.wait_for(model.chat(messages, tools=tools), timeout=wd)
++            except asyncio.TimeoutError:
++                raise _WatchdogTimeout("watchdogtimeout: no generation within %ds" % wd) from None
++            if time.monotonic() - started > 600.0:
++                # Succeeded, but only after ~2 wasted gateway samples: the run
++                # will keep paying that price unless the replies get smaller.
++                state["stalled"] = True
+             for i in reversed(injected):
+                 del messages[i]  # the note did its job; do not shape later turns
+             return reply
+@@ -368,13 +419,16 @@
+                 attempt += 1
+                 _shrink_history(messages)
+                 continue
+-            if _is_cutoff(text) and cutoffs < 2:
+-                attempt += 1
+-                _shrink_history(messages, keep_last=2 if cutoffs else 6)
+-                injected.append(len(messages))
+-                messages.append({"role": "system", "content": CUTOFF_NOTES[cutoffs]})
+-                cutoffs += 1
+-                continue
++            if _is_cutoff(text):
++                state["stalled"] = True
++                if cutoffs < 2:
++                    attempt += 1
++                    _shrink_history(messages, keep_last=2 if cutoffs else 6)
++                    injected.append(len(messages))
++                    messages.append({"role": "user", "content": CUTOFF_NOTES[cutoffs]})
++                    cutoffs += 1
++                    continue
++                raise
+             attempt += 1
+             transient = isinstance(exc, json.JSONDecodeError) or any(
+                 s in text for s in ("generationcutoff", "cutoff", "timeout", "timed out",
+@@ -407,6 +461,8 @@
+     messages = [{"role": "system", "content": system}, {"role": "user", "content": instruction}]
+     repeat = {"keys": []}
+     pace = {}
++    state = {"stalled": False,   # generations being cut off / sampled for many minutes
++             "tool_calls": 0}    # completed tool calls; selects the watchdog deadline
+     nudges = 0            # finish-check nudges spent over the whole run
+     bare_streak = 0       # consecutive replies without a tool call
+     delivery_seen = False # a delivery/termination-style tool has been called
+@@ -414,7 +470,7 @@
+     emergency_used = False
+     while True:
+         try:
+-            reply = await call_model(model, messages, tools)
++            reply = await call_model(model, messages, tools, state)
+         except Exception as exc:
+             made_progress = len(messages) > 2  # more than system+user: a call got through
+             if made_progress and not emergency_used:
+@@ -428,7 +484,7 @@
+                     "[harness] The previous request failed at the provider (%s), so"
+                     " nothing was lost except time. Continue the task: reply with"
+                     " the single next tool call, kept short." % type(exc).__name__})
+-                reply = await call_model(model, messages, tools)
++                reply = await call_model(model, messages, tools, state)
+             elif mcp_tools and not degraded:
+                 # Nothing has happened yet in this run: if task tools look like
+                 # the problem (e.g. the gateway rejects their schemas), fall
+@@ -441,11 +497,18 @@
+                                              " endpoints and transports.")
+                 tools = [BASH_TOOL]
+                 mcp_tools, mcp_by_name = [], {}
+-                reply = await call_model(model, messages, tools)
++                reply = await call_model(model, messages, tools, state)
+             else:
+                 raise
+         messages.append(reply.message)
+         if not reply.tool_calls:
++            # A reply cut off mid-sentence is not a final message at all: nudge
++            # to continue regardless of environment (bash-only runs included,
++            # which the delivery check below deliberately does not cover).
++            if _looks_truncated(reply.text) and nudges < 3:
++                nudges += 1
++                messages.append({"role": "user", "content": TRUNCATED_NOTE})
++                continue
+             # Bare text in a tool environment reaches no one. Nudge, escalate,
+             # and nudge once more if needed; whatever follows the last nudge
+             # (or a third bare reply) ends the run.
+@@ -469,6 +532,7 @@
+                 out = "unknown tool %r; available: bash, MCP tools: %s" % (
+                     call.name, ", ".join(sorted(mcp_by_name)) or "none")
+             out = clip_output(out)
++            state["tool_calls"] += 1
+             key = (call.name, json.dumps(args, sort_keys=True, ensure_ascii=True)[:400], out[:400])
+             repeat["keys"] = (repeat["keys"] + [key])[-3:]
+             if len(repeat["keys"]) == 3 and len(set(repeat["keys"])) == 1:
+@@ -477,5 +541,6 @@
+                         " wait first); otherwise stop repeating: change something in how you"
+                         " attack this, or finish the task.")
+             messages.append({"role": "tool", "tool_call_id": call.id,
+-                             "content": out + pace_note(t0, pace) + "\n" + time_tag(t0)})
++                             "content": out + pace_note(t0, pace)
++                             + (STALL_NOTE if state["stalled"] else "") + "\n" + time_tag(t0)})
+             _maybe_compact(messages)

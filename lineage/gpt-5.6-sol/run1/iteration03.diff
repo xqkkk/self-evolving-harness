@@ -1,0 +1,98 @@
+--- iteration02/harness.py
++++ iteration03/harness.py
+@@ -18,9 +18,14 @@
+ - Verify exact names, dates, units, formats, destinations, and side effects before finishing. Check final state through an authoritative read, not just a command's success message. If blocked, try reasonable alternatives and leave the best valid partial result.
+ - For ambiguous requests, distinguish details that can be discovered safely from choices that materially change the outcome. Investigate the former; ask one focused question about the latter before acting.
+ - For multi-part or interactive work, keep a checklist of requested outcomes and policy gates. After each state change, record what actually succeeded. Do not silently drop an item, claim an unobserved result, repeat an irreversible action, or perform plausible extras the user did not request.
++- For event-driven or time-sensitive work, model the request as a state machine. Record an authoritative baseline and target time before waiting; notifications are wake-ups, not proof that the deadline or condition was met. At the trigger, reread the clock and relevant state, compute changes by stable identifiers, then apply each conditional branch exactly once.
++- For calculations and document research, preserve a short provenance chain from source location and table headers through units, operands, formula, and final formatting. Search for revisions and competing matches, and independently recompute rather than trusting a plausible first result.
++- For substantial repository changes, translate the request into a contract matrix (behavior, integration points, edge cases, and evidence). Trace each requested behavior to production code, test the externally observable path, and inspect the final diff for omissions and accidental scope.
+ 
+ MCP application tools, when present, are exposed directly by name. Call them directly; do not implement an MCP client with bash. Follow task-specific interaction and termination rules exactly, inspect notifications, and avoid unnecessary user-facing messages. Search documentation with narrow questions and synthesize the evidence before acting rather than repeatedly browsing.
+-A response with no tool call ends your run. In interactive environments, communicate and finish through the designated tools; do not emit a plain response while required work remains. Otherwise, when the task is done, reply concisely with no tool calls."""
++A response with no tool call ends your run. In interactive environments, conserve turns, treat each user reply as new evidence rather than permission to relax policy, and communicate and finish through the designated tools. Use the exact required termination protocol; do not emit a plain response while required work remains. Otherwise, when the task is done, reply concisely with no tool calls."""
++
++FRESH_REVIEW_PROMPT = """You are the independent final reviewer taking over after another worker attempted the task. The current filesystem is authoritative; the prior conversation is intentionally unavailable to reduce anchoring. Reconstruct a concise requirement-to-evidence checklist from the original request, inspect the existing artifacts and diff, and run focused checks. For numerical work, independently locate and recompute the source values. For code, reason adversarially about boundaries and integration, not merely whether existing tests pass. Preserve correct work and make only material fixes. Do not seek hidden tests, reference answers, or upstream solutions. When every requirement is supported by evidence, give the concise final response."""
+ 
+ BASH_TOOL = {
+     "type": "function",
+@@ -58,6 +63,33 @@
+     head, tail = int(limit * 0.65), int(limit * 0.30)
+     return (text[:head] + f"\n\n[... {len(text)-head-tail} characters clipped by harness; "
+             "rerun a focused command or redirect output to a file ...]\n\n" + text[-tail:])
++
++
++def _declared_terminal_reply(text, instruction):
++    """Recognize a short stop token explicitly prescribed by the task."""
++    token = (text or "").strip()
++    if not token or len(token) > 100:
++        return False
++    source = instruction.lower()
++    token_lower = token.lower()
++    start = 0
++    while True:
++        pos = source.find(token_lower, start)
++        if pos < 0:
++            return False
++        context = source[max(0, pos - 140):pos + len(token) + 140]
++        if (any(word in context for word in ("reply", "respond", "emit", "output"))
++                and any(word in context for word in ("stop", "terminate", "end the conversation"))):
++            return True
++        start = pos + 1
++
++
++def _terminal_tool(name):
++    normalized = re.sub(r"[^a-z]+", "_", name.lower())
++    return ("termination" in normalized or bool(re.search(
++        r"(?:end|finish|terminate|stop).*(?:conversation|session|interaction|run)",
++        normalized,
++    )))
+ 
+ 
+ def _tool_schema(item):
+@@ -155,6 +187,7 @@
+         messages.append({"role": "system", "content": "\n".join(notices)})
+     tools = [BASH_TOOL, IMAGE_TOOL, *mcp_tools]
+     completion_audits = 0
++    terminal_action = False
+     while True:
+         messages = _shrink_history(messages)
+         try:
+@@ -181,10 +214,26 @@
+             continue
+         messages.append(reply.message)
+         if not reply.tool_calls:
++            # Once the environment has been explicitly closed, an extra audit can
++            # only waste a turn or violate a prescribed stop protocol.
++            if routes and (terminal_action or _declared_terminal_reply(reply.text, instruction)):
++                return
+             if completion_audits == 0:
+                 completion_audits += 1
+-                messages.append({"role": "system", "content":
+-                    "Completion audit: independently compare the current verified state with every part of the user's request and all stated constraints. Do not repeat completed side effects. If anything remains, use tools to finish it; if not, give the final concise response."})
++                if routes:
++                    # Interactive work may include irreversible operations and an
++                    # in-progress conversation, so retain its transactional history.
++                    messages.append({"role": "system", "content":
++                        "Completion audit: compare authoritative current state with every requested outcome, condition, and policy gate. Check timestamps and notifications when relevant. Do not repeat side effects. If the task has a required communication or termination tool, use it exactly as instructed; if it already terminated, return only the required stop response."})
++                else:
++                    # A fresh context is a less anchored reviewer and avoids paying
++                    # repeatedly for a long implementation trajectory. The artifacts
++                    # and original contract are sufficient to audit local work.
++                    messages = [
++                        {"role": "system", "content": SYSTEM_PROMPT},
++                        {"role": "user", "content": instruction},
++                        {"role": "system", "content": FRESH_REVIEW_PROMPT},
++                    ]
+                 continue
+             return
+         extra_images = []
+@@ -205,6 +254,8 @@
+                 elif call.name in routes:
+                     url, sid, actual_name = routes[call.name]
+                     output = _clip(await mcp_bridge.call(world, url, sid, actual_name, call.arguments))
++                    if _terminal_tool(actual_name) and not output.startswith(("MCP error:", "MCP tool reported an error:")):
++                        terminal_action = True
+                 else:
+                     output = f"Unknown tool: {call.name}"
+             except Exception as exc:

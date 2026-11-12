@@ -1,0 +1,151 @@
+--- iteration03/harness.py
++++ iteration04/harness.py
+@@ -11,10 +11,10 @@
+ 
+ Work method:
+ 1. Parse the deliverable, constraints, exact output location/format, and success criteria into a concrete checklist; keep track of pending parts until the final audit. Inspect the relevant files and environment before acting. Do not assume tools such as rg, jq, or a particular test runner are installed.
+-2. Form a short evidence-based plan, then execute it. Prefer narrow searches and bounded output. Exclude generated, minified, dependency, and build directories unless they are genuinely relevant. Redirect potentially large output to a file and inspect selected ranges or summaries. Put explicit timeouts around commands that might hang.
+-3. Validate independently before finishing. Check required artifacts exist and match the requested format. For code, understand surrounding conventions and tests, fix the root cause rather than a one-off example, consider boundary/error cases, run focused tests and then the broadest practical checks, and review the final diff. A newly failing existing test is evidence of a compatibility bug: fix it rather than excluding it or declaring it obsolete. Do not weaken tests or unrelated behavior.
+-4. For document/data questions, distinguish exact definitions, populations, period/date, units, signs, totals versus components, and percent versus decimal. Inspect table titles, headings, row/column alignment and footnotes; when revisions matter, find the latest source that reports the requested period and verify that later sources did not revise it. State the observations and formula, calculate with a script, and re-read the source context as an independent check. Do not silently substitute a similar metric.
+-5. For interactive scenarios, treat the requested action and its stopping point literally; do not extend a preparatory or informational request into a downstream committing operation. Capture the initial state when relevant, inspect every notification and tool error, honor temporal cutoffs, and verify final state after consequential actions. Re-evaluate the full request when new messages arrive; do not guess a materially ambiguous target or execute multiple possible interpretations. Calls in one assistant turn run concurrently, so batch only independent operations—put reads and dependent or ordered mutations in separate turns. After a timeout or transport failure, inspect state before replaying any call that may already have committed. Do not announce completion before waits or follow-up events are resolved, and do not send an unrequested user-facing update. If the protocol requires an initial tool call, make it before conversational text; a readiness statement is not completion.
++2. Form a short evidence-based plan, then execute it. Prefer narrow searches and bounded output. Exclude generated, minified, dependency, and build directories unless they are genuinely relevant. Redirect potentially large output to a file and inspect selected ranges or summaries. Put explicit timeouts around commands that might hang. When a request says all, highest/lowest, newest, or otherwise ranks a collection, establish that pagination and search coverage are complete before choosing; distinguish products from their variants and deduplicate by the requested identity.
++3. Validate independently before finishing. Check required artifacts exist and match the requested format. For code, turn every stated requirement into a checklist of observable behavior and exact public contracts (names, signatures, defaults, ordering, error behavior), inspect all production call sites, and preserve compatibility only where it does not weaken the requested contract. Fix the root cause rather than a one-off example, consider boundary/error cases, run focused tests and then the broadest practical checks, and review the final diff. A newly failing existing test is evidence of a compatibility bug: fix it rather than excluding it or declaring it obsolete. Do not weaken tests or unrelated behavior.
++4. For document/data questions, distinguish exact definitions, populations, period/date, units, signs, totals versus components, and percent versus decimal. Inspect table titles, headings, row/column alignment and footnotes; when revisions matter, find the latest source that reports the requested period and verify that later sources did not revise it. A question about a page, chart, or visual layout requires visual evidence: page boundaries in extracted text are not a substitute, so locate/render the source page or its image when available and explicitly define any visual counting rule (including ties and endpoints). State the observations and formula, calculate with a script, and re-read the source context as an independent check. Do not silently substitute a similar metric.
++5. For interactive scenarios, treat the requested action and its stopping point literally; do not extend a preparatory or informational request into a downstream committing operation. Capture the initial state when relevant, inspect every notification and tool error, honor temporal cutoffs, and verify final state after consequential actions. Re-evaluate the full request when new messages arrive; do not guess a materially ambiguous target or execute multiple possible interpretations. Ask one concise clarification before the blocked action, then stop unless the protocol explicitly supplies a way to await the answer. Calls in one assistant turn are conceptually unordered, so batch only independent operations—put reads and dependent or ordered mutations in separate turns. Keep a timeline for deadline-based workflows: anchor it to the event the user named, process arrivals in order, act at the earliest required event, and never replace “exactly” or “immediately” with an arbitrary polling delay. After a timeout or transport failure, inspect state before replaying any call that may already have committed. Treat user-facing sends as consequential actions: send only requested checkpoints, clarifications, and final answers, never progress chatter. Do not announce completion before waits or follow-up events are resolved. If the protocol requires an initial tool call, make it before conversational text; a readiness statement is not completion.
+ 6. Manage the task's time as a resource. Sample or benchmark potentially expensive work before scaling it, prefer batching or parallelism over long serial loops, set realistic command timeouts, and preserve enough time for validation and the required artifact. If one approach is too slow or repeatedly fails, diagnose once and switch strategies rather than retrying blindly.
+ 
+ Tool output shown to you may be abbreviated when it is very large; the full command still ran. If that happens, rerun a targeted query or save and inspect the relevant slice. Preserve user work. Keep going until the result is verified, then give a concise final response and make no further tool calls."""
+@@ -130,11 +130,14 @@
+             return
+ 
+         mcp_calls += sum(call.name in bridge.routes for call in reply.tool_calls)
+-        # Tool calls emitted in one assistant message are independent by API
+-        # contract.  Execute them concurrently, then preserve their original
+-        # order in the transcript.  This matters for searches and test shards
+-        # that would otherwise spend most of the task budget waiting serially.
+-        outputs = await asyncio.gather(*(execute(call) for call in reply.tool_calls))
++        # Keep stateful MCP operations in a deterministic order. Besides avoiding
++        # application races, a streamable-HTTP session has one logical stream on
++        # which reverse requests and delayed responses are correlated. Pure shell
++        # inspections/test shards remain safe to run concurrently.
++        if any(call.name in bridge.routes for call in reply.tool_calls):
++            outputs = [await execute(call) for call in reply.tool_calls]
++        else:
++            outputs = await asyncio.gather(*(execute(call) for call in reply.tool_calls))
+         for call, output in zip(reply.tool_calls, outputs):
+             messages.append({
+                 "role":"tool", "tool_call_id":call.id,
+--- iteration03/mcp_bridge.py
++++ iteration04/mcp_bridge.py
+@@ -18,19 +18,32 @@
+ import time
+ import uuid
+ 
+-_REMOTE = r'''import json, os, sys, time, urllib.request
++_REMOTE = r'''import json, os, sys, threading, time, urllib.request
+ url, mode = sys.argv[1], sys.argv[2]
+ sid = None if sys.argv[3] == "-" else sys.argv[3]
+ payload = json.loads(sys.argv[4])
+ rpc_id = int(sys.argv[5])
+ job = sys.argv[6] if len(sys.argv) > 6 else None
+ request_no = 0
++stop_listener = threading.Event()
++listener_ready = threading.Event()
++async_response = None
++async_response_ready = threading.Event()
+ 
+ def atomic_write(path, value):
+     tmp = path + ".tmp"
+     with open(tmp, "w") as f:
+         json.dump(value, f)
+     os.replace(tmp, path)
++
++def dispatch(value):
++    """Route messages from either the POST response or the server SSE channel."""
++    global async_response
++    if value.get("id") == rpc_id and ("result" in value or "error" in value):
++        async_response = value
++        async_response_ready.set()
++    elif value.get("method") and "id" in value:
++        reverse_request(value)
+ 
+ def reverse_request(value):
+     global request_no
+@@ -87,9 +100,29 @@
+             except Exception: continue
+             if value.get("id") == obj.get("id") and ("result" in value or "error" in value):
+                 return value
+-            if value.get("method") and "id" in value:
+-                reverse_request(value)
++            dispatch(value)
+         raise RuntimeError("MCP stream ended without a matching response")
++
++def listen():
++    """Receive server-initiated requests sent on the standalone SSE channel."""
++    h = {"Accept":"text/event-stream", "MCP-Protocol-Version":"2025-03-26"}
++    if sid: h["Mcp-Session-Id"] = sid
++    req = urllib.request.Request(url, headers=h, method="GET")
++    try:
++        with urllib.request.urlopen(req, timeout=900) as r:
++            listener_ready.set()
++            for raw in r:
++                if stop_listener.is_set(): return
++                line = raw.decode("utf-8", "replace").strip()
++                if not line.startswith("data:"): continue
++                try: value = json.loads(line[5:].strip())
++                except Exception: continue
++                dispatch(value)
++    except Exception:
++        # Some servers do not offer a standalone stream and return tool
++        # responses directly on POST; that remains fully supported.
++        listener_ready.set()
++        return
+ 
+ def main():
+     if mode == "init":
+@@ -100,8 +133,18 @@
+         post({"jsonrpc":"2.0", "method":"notifications/initialized", "params":{}}, False)
+         tools = post({"jsonrpc":"2.0", "id":2, "method":"tools/list", "params":{}})
+         return {"ok":True, "session":sid, "initialize":ans, "tools":tools}
+-    ans = post({"jsonrpc":"2.0", "id":rpc_id, "method":"tools/call", "params":payload})
+-    return {"ok":True, "response":ans}
++    listener = threading.Thread(target=listen, daemon=True)
++    listener.start()
++    # Avoid racing the tool request with registration of the server-to-client
++    # stream. Servers which reject GET release this wait immediately.
++    listener_ready.wait(5)
++    try:
++        ans = post({"jsonrpc":"2.0", "id":rpc_id, "method":"tools/call", "params":payload})
++        if ans is None and async_response_ready.wait(900):
++            ans = async_response
++        return {"ok":True, "response":ans}
++    finally:
++        stop_listener.set()
+ 
+ try:
+     result = main()
+@@ -241,7 +284,7 @@
+             f"rm -rf {shlex.quote(job)}; mkdir -p {shlex.quote(job)}; "
+             f"({command} >/dev/null 2>{shlex.quote(job + '/stderr')}; "
+             f"echo $? > {shlex.quote(job + '/exit')}) "
+-            f"</dev/null >/dev/null 2>&1 &"
++            f"</dev/null >/dev/null 2>&1 & echo $! > {shlex.quote(job + '/pid')}"
+         )
+         out = await self.world.exec(launch, timeout_s=30)
+         if out.return_code:
+@@ -293,6 +336,15 @@
+                 wr = await self.world.exec(write, timeout_s=30)
+                 if wr.return_code:
+                     raise RuntimeError("could not answer MCP reverse request: " + wr.stderr)
++        # Do not leave a timed-out request running: replay decisions must be
++        # based on server state, not on an old worker committing unexpectedly.
++        stop = (f"p=$(cat {shlex.quote(job + '/pid')} 2>/dev/null) || exit 0; "
++                f"pkill -TERM -P \"$p\" 2>/dev/null || true; "
++                f"kill -TERM \"$p\" 2>/dev/null || true")
++        try:
++            await self.world.exec(stop, timeout_s=10)
++        except Exception:
++            pass
+         raise TimeoutError("MCP call did not finish within 600 seconds")
+ 
+     async def call(self, public_name, arguments):

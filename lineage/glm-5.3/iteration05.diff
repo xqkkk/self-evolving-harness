@@ -1,0 +1,170 @@
+--- iteration04/harness.py
++++ iteration05/harness.py
+@@ -185,13 +185,15 @@
+ 
+ async def run(instruction, model, world):
+     t0 = time.monotonic()
++    repeats = {}      # (tool, arguments) -> times called unchanged, in a row
+     stats = {"execs": 0, "mcp_calls": 0, "trims": 0, "unknown_tools": 0,
+              "peak_prompt_tokens": 0, "mcp_servers": [], "mcp_tools": 0,
+              "bounces": 0, "milestones": 0, "plan_updates": 0,
+              "files_changed_last": None, "final_reply_chars": None,
+              "context_errors": 0, "prompt_trigger": PROMPT_TRIGGER,
+              "longest_exec_s": 0, "model_retries": 0,
+-             "gen_cutoffs": 0, "long_calls": 0, "kept_files": 0}
++             "gen_cutoffs": 0, "long_calls": 0, "kept_files": 0,
++             "repeat_calls": 0}
+     bridge = Bridge(world)
+     defs, names = await bridge.discover(instruction)
+     stats["mcp_servers"], stats["mcp_tools"] = [s[0] for s in bridge.servers], len(defs)
+@@ -284,10 +286,20 @@
+                                          t0, plan)
+                 elif call.name in bridge.tools:
+                     stats["mcp_calls"] += 1
++                    key = (call.name, json.dumps(call.arguments, sort_keys=True))
++                    seen = repeats.get(key, 0) + 1     # identical world-changing call
++                    repeats[key] = seen
+                     out = await context.keep(await bridge.call(call.name, call.arguments),
+                                              limit=context.clip_budget(
+                                                  context.size(messages)),
+                                              world=world, stats=stats)
++                    if seen >= 3:
++                        stats["repeat_calls"] = seen
++                        out += (f"\n[harness] this is call {seen} of the same "
++                                f"{call.name} with identical arguments. If it errored, an "
++                                "identical retry cannot fix it — read the error and change "
++                                f"the arguments. If it succeeded, you have done it {seen} "
++                                f"times, and a judge may count {seen} actions.")
+                     out += "\n" + footer(t0, plan)
+                 else:
+                     stats["unknown_tools"] += 1
+--- iteration04/mcp.py
++++ iteration05/mcp.py
+@@ -149,6 +149,51 @@
+     return "".join(c if (c.isalnum() or c in "_-") else "_" for c in name)
+ 
+ 
++def _coerce(schema, arguments):
++    """Nudge argument values to the types the tool's own schema declares.
++
++    Models habitually quote numbers, booleans, lists and objects, and a typed
++    server then answers with an error the model works around by repeating the
++    call — which changes the world twice. Only lossless moves are made here; a
++    value already the right shape, or one the schema is silent about, stays as
++    the model sent it.
++    """
++    if not isinstance(arguments, dict) or not isinstance(schema, dict):
++        return arguments, []
++    out, changed = dict(arguments), []
++    for name, spec in (schema.get("properties") or {}).items():
++        if name not in out or not isinstance(spec, dict):
++            continue
++        v, nv = out[name], out[name]
++        kind = spec.get("type")
++        if isinstance(kind, list):        # e.g. ["integer", "null"]
++            kind = next((x for x in kind if x and x != "null"), None)
++        if kind in ("integer", "number") and isinstance(v, str):
++            try:
++                f = float(v)
++            except ValueError:
++                continue
++            if kind == "integer" and (f != int(f) or "e" in v.lower()):
++                continue                  # a lossy or exotic cast is not ours to make
++            nv = int(f) if kind == "integer" else f
++        elif kind == "boolean" and isinstance(v, str):
++            low = v.strip().lower()
++            nv = True if low in ("true", "yes") else False if low in ("false", "no") else v
++        elif kind in ("array", "object") and isinstance(v, str):
++            try:
++                nv = json.loads(v)
++            except ValueError:
++                nv = [s.strip() for s in v.split(",")] if (kind == "array" and "," in v) else v
++            if not isinstance(nv, list if kind == "array" else dict):
++                nv = v
++        elif kind == "string" and isinstance(v, int) and not isinstance(v, bool):
++            nv = str(v)
++        if type(nv) is not type(v):
++            out[name] = nv
++            changed.append(f"{name}: {json.dumps(v)[:60]} -> {json.dumps(nv)[:60]}")
++    return out, changed
++
++
+ def find_servers(instruction):
+     """`(name, url, command)` for every MCP server the task mentions."""
+     out, seen = [], set()
+@@ -186,7 +231,9 @@
+         self._installed = None
+         self.sessions = {}
+         self.tools = {}      # tool name -> ((name, url, command), real MCP name)
++        self.schemas = {}    # tool name -> the parameters schema we published
+         self.servers = []
++        self._notes = 0      # coercion lessons handed out: a lesson, not a metronome
+ 
+     async def _run(self, script, timeout_s):
+         r = await self.world.exec(script, timeout_s=timeout_s)
+@@ -234,6 +281,7 @@
+                 self.tools[alias] = (server, real)
+                 fn = {"name": alias, "parameters": self._schema(t.get("inputSchema")),
+                       "description": str(t.get("description") or real)[:2000]}
++                self.schemas[alias] = fn["parameters"]
+                 defs.append({"type": "function", "function": fn})
+         return defs, list(self.tools)
+ 
+@@ -250,10 +298,12 @@
+         server, real = self.tools[alias]
+         name, url, command = server
+         timeout = default_timeout
++        changed = []
+         if isinstance(arguments, dict):
+             raw = arguments.pop("_timeout_s", None)
+             if isinstance(raw, (int, float)) and raw > 0:
+                 timeout = min(float(raw), 900.0)
++            arguments, changed = _coerce(self.schemas.get(alias), arguments)
+         args = json.dumps(arguments if isinstance(arguments, dict) else {})
+         bound = max(int(timeout), 5) + 15
+         sid = shlex.quote(self.sessions.get(name, "-"))
+@@ -266,7 +316,13 @@
+         obj = _last_json(r.stdout) or {"ok": False, "error": (r.stderr or r.stdout or "no output")[-2000:]}
+         if obj.get("session") and url:
+             self.sessions[name] = obj["session"]
+-        return self._render(real, obj)
++        text = self._render(real, obj)
++        if changed and self._notes < 2:
++            self._notes += 1
++            text += (f"\n[harness] coerced to the schema's types ({'; '.join(changed[:3])}). "
++                     "Send numbers, booleans, lists and objects as JSON values, not quoted "
++                     "strings; never repeat a world-changing call to work around an error.")
++        return text
+ 
+     def _render(self, real, obj):
+         if not obj.get("ok"):
+--- iteration04/prompts.py
++++ iteration05/prompts.py
+@@ -31,6 +31,27 @@
+ which time zone, which of several near-identical records, and re-read the requirement
+ it is meant to satisfy.
+ 11. Anything you write under `/logs/agent/` is kept with the run's record and read later by whoever maintains this harness. If a tool, the environment, or your own approach wasted the run, a line or two there is worth more than silence. Never spend task time on it.
++
++Four finer points about tools and judges:
++
++- Pass arguments as the JSON types the schema declares: numbers as numbers,
++  booleans as booleans, lists as lists. A quoted number is the commonest
++  reason a typed tool rejects a call, and the commonest wrong response is to
++  repeat the action or route around the tool — fix the argument instead.
++- A tool that answers "unknown", "locked" or "not available" is more often
++  gated than gone. Look for the environment's own way to list, unlock or
++  grant such tools, and re-read what the task said about how they are
++  exposed, before concluding it is unreachable.
++- When a request names a plural set — all, each, every, both, the five
++  oldest — enumerate the members first, keep the list where you can tick
++  them off, and act on exactly as many as it names, no more. Check the count
++  you acted on against the count asked for before reporting.
++- Where a repo's tests will judge you and you cannot see them, they were
++  written against the real implementation and may reach into its internals
++  by name. Keep the diff minimal and idiomatic, reuse the names and
++  structure the file already has, rename nothing you had no reason to
++  rename, and verify with the widest test command the repo's own CI would
++  run rather than the one package you touched.
+ 
+ When the task is complete, reply with a final message and no tool calls.
+ """

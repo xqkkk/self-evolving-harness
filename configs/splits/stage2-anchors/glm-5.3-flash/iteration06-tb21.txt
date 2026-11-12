@@ -1,0 +1,4 @@
+terminal-bench/log-summary-date-ranges
+terminal-bench/nginx-request-logging
+terminal-bench/sqlite-db-truncate
+terminal-bench/compile-compcert

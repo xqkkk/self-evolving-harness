@@ -1,0 +1,183 @@
+--- iteration02/harness.py
++++ iteration03/harness.py
+@@ -8,10 +8,14 @@
+ sampling, so they are capped, and the history is shrunk plus a brevity note is
+ injected before the retry instead of resending the same request); (3) runs
+ died cancelled-with-deliverable or ended with the reply trapped as plain text
+-in tool-driven environments - so tool results carry escalating pace notes, an
+-end-of-run check gives one chance to act through the environment's own tools,
+-old tool outputs are compacted before the token cap is hit, and bash commands
+-cannot hang for the whole budget.
++in tool-driven environments - so tool results carry escalating pace notes and
++bash commands cannot hang for the whole budget; (4) round 3 showed the
++round-2 end-of-run check fired only once and its escape hatch won: in every
++failed tool-environment trial the final message was composed as bare text,
++never sent, and the single soft nudge drew back an identical repeat. The
++finish check now escalates over up to three nudges, names the environment's
++delivery/termination tools, and tones itself by whether a delivery-style tool
++has been called; old tool outputs are compacted before the token cap is hit.
+ """
+ 
+ import asyncio
+@@ -32,7 +36,7 @@
+ TOOL_TAIL = 10000
+ MCP_NOTE_HEADER = "MCP servers reachable from inside the task container:"
+ EXEC_TIMEOUT_S = 1800.0          # one command must not be able to eat the run
+-COMPACT_AT_CHARS = 700_000       # stay well under the gateway's input-token cap
++COMPACT_AT_CHARS = 480_000       # ~140k tokens; leave headroom under the 258k cap
+ 
+ BASH_TOOL = {"type": "function", "function": {
+     "name": "bash",
+@@ -52,11 +56,11 @@
+ 3. Work in small verified steps: run a command, read the result, adjust. When something fails, read the actual error and change something - do not repeat the same call expecting a different result.
+ 4. Be economical with output: search and slice (grep -n, sed -n, head, tail) instead of dumping whole files; batch related commands into one call.
+ 5. Checkpoint the deliverable: as soon as a required artifact exists in acceptable form, write it to the requested location; refine afterwards if time allows. Never leave a task without its deliverable in place.
+-6. Verify before finishing: re-read the task's requirements and check each against what you actually produced (exact path, exact format, the value actually asked for); if a checker or test suite exists, run it.
++6. Verify before finishing: re-read the task's requirements and check each against what you actually produced (exact path, exact format, the value actually asked for); if a checker or test suite exists, run it. When the deliverable is a specific value, re-derive it once by an independent method before answering: carry full precision through intermediate steps, watch units and rounding conventions, and round only at the final step, exactly as the task asks.
+ 7. When the task asks a question, make your final message state the exact answer plainly - the precise value, name, or phrase requested - not just reasoning around it.
+-8. Deliver through the environment's own channels: if the task provides tools for sending messages, submitting, saving, or terminating (or names a required file or channel), perform those acts with those tools; a plain-text reply reaches no one and simply ends the run. If a requirement is genuinely ambiguous and you can ask the user a question, ask one concise question early; otherwise proceed on the most conservative reading and state your assumption.
+-
+-Each tool result is clipped if very long (a marker shows what was dropped) and ends with the run's elapsed wall-clock time. Use that to pace yourself: your total budget is unknown and varies by task, so earn margin early - front-load the inventory, treat long installs, builds, or training runs as the wrong trade, and keep the deliverable present and valid in its required location from the first minutes so the run could end cleanly at any moment. As elapsed time grows, shift from exploring to finishing and verifying.
++8. Deliver through the environment's own channels: if the task provides tools for sending messages, submitting, saving, or terminating (or names a required file or channel), perform those acts with those tools; a plain-text reply reaches no one and simply ends the run. If a requirement is genuinely ambiguous and you can ask the user a question, ask one concise question early; otherwise proceed on the most conservative reading and state your assumption. Before finishing, check whether the instructions define an ending protocol (a stop token, or an end/terminate/submit call) and perform it.
++
++Each tool result is clipped if very long (a marker shows what was dropped) and ends with the run's elapsed wall-clock time. Use that to pace yourself: your total budget is unknown and varies by task, so earn margin early - front-load the inventory, treat long installs, builds, or training runs as the wrong trade, and keep the deliverable present and valid in its required location from the first minutes so the run could end cleanly at any moment. As elapsed time grows, shift from exploring to finishing and verifying. Keep reasoning bursts short: prefer a small tool call now over long uninterrupted deliberation - you learn more per token from a tool result than from speculation, and very long single calls waste wall clock and can be cut off.
+ 
+ Keep each individual reply compact: a reply that runs very long can be cut off by the gateway before it completes, losing everything in it. Produce large content in several smaller tool calls (for example append to a file in chunks) rather than one enormous block, and summarize results instead of echoing bulk output back.
+ 
+@@ -128,17 +132,45 @@
+ 
+ 
+ # Tool-driven environments often need an explicit action (send, submit, save,
+-# terminate) for a reply or a finish to take effect; a bare text reply reaches
+-# no one. When the model ends with plain text, give it one chance to act before
+-# the run closes.
+-FINISH_CHECK = (
+-    "[harness] Your reply contained no tool call, so the run is about to end."
+-    " In this environment a plain-text reply does not reach any application or"
+-    " user. If any required step is still outstanding - sending a message,"
+-    " submitting, saving, or terminating through this environment's own tools -"
+-    " do it now. If the text above is already the complete final answer and no"
+-    " tool action is needed, reply with that same final answer unchanged."
+-)
++# terminate, or a stop token defined by the task) for a reply or a finish to
++# take effect; a bare text reply reaches no one. Round-3 evidence: in every
++# failed tool-environment trial the model ended with an unsent bare-text final
++# message, and a single soft nudge drew back an identical repeat - the escape
++# hatch won. So the check escalates: nudge once, then firmer, with the tone of
++# the follow-up chosen by whether any delivery-style tool has been called.
++DELIVERY_STEMS = ("send", "submit", "deliver", "reply", "end", "finish",
++                  "terminate", "complete", "stop", "save", "close", "checkout")
++
++
++def _delivery_candidates(tool_names):
++    return [n for n in tool_names if any(s in n.lower() for s in DELIVERY_STEMS)][:8]
++
++
++def finish_check(stage, delivery_seen, tool_names):
++    cands = _delivery_candidates(tool_names)
++    listing = (" Among your available tools, these look like delivery or termination"
++               " actions: " + ", ".join("`%s`" % c for c in cands) + ".") if cands else ""
++    if stage == 1:
++        return ("[harness] Your reply contained no tool call, so the run is about to"
++                " end - and plain text reaches no application or user. Before it"
++                " closes, do whatever outstanding step needs a tool: send or submit"
++                " the final message through this environment's own tools, or perform"
++                " the ending protocol the task instructions define (an"
++                " end/terminate/stop action or stop token)." + listing +
++                " Only if you are certain no tool action is required, reply with"
++                " this same final answer unchanged.")
++    if delivery_seen:
++        return ("[harness] Still no tool call. If every delivery and termination"
++                " step is already done, reply with the same final answer unchanged"
++                " and the run closes. If anything is still unsent, or the"
++                " environment has not been told you are finished, call the tool"
++                " that does it now.")
++    return ("[harness] Still no tool call, so nothing you have written has reached"
++            " the application or user, and the run ends after this. Deliver now:"
++            " send your final message through this environment's send/submit-style"
++            " tool, or call its end/terminate action, as the task requires." +
++            listing + " If and only if no such tool exists here, reply with the"
++            " same final answer.")
+ 
+ def _last_json(text):
+     for line in reversed((text or "").splitlines()):
+@@ -375,37 +407,60 @@
+     messages = [{"role": "system", "content": system}, {"role": "user", "content": instruction}]
+     repeat = {"keys": []}
+     pace = {}
+-    finish_checked = False
++    nudges = 0            # finish-check nudges spent over the whole run
++    bare_streak = 0       # consecutive replies without a tool call
++    delivery_seen = False # a delivery/termination-style tool has been called
+     degraded = False
++    emergency_used = False
+     while True:
+         try:
+             reply = await call_model(model, messages, tools)
+         except Exception as exc:
+-            # Nothing has happened yet in this run: if task tools look like the
+-            # problem (e.g. the gateway rejects their schemas), fall back to
+-            # bash-only once instead of ending with zero progress.
+-            if not mcp_tools or degraded:
++            made_progress = len(messages) > 2  # more than system+user: a call got through
++            if made_progress and not emergency_used:
++                # A fatal error escaped mid-run (stalled cut-offs, dead
++                # connection). Everything so far would be lost; one bounded
++                # retry on a changed request is strictly better than dying.
++                # Tools are kept: the failure is provider-side, not theirs.
++                emergency_used = True
++                _shrink_history(messages, keep_last=2)
++                messages.append({"role": "user", "content":
++                    "[harness] The previous request failed at the provider (%s), so"
++                    " nothing was lost except time. Continue the task: reply with"
++                    " the single next tool call, kept short." % type(exc).__name__})
++                reply = await call_model(model, messages, tools)
++            elif mcp_tools and not degraded:
++                # Nothing has happened yet in this run: if task tools look like
++                # the problem (e.g. the gateway rejects their schemas), fall
++                # back to bash-only once instead of ending with zero progress.
++                degraded = True
++                mcp_notes.append("task tools dropped after %s: %s" % (type(exc).__name__, exc))
++                messages[0]["content"] += ("\n\nMCP status: " + " ".join(mcp_notes)
++                                           + "\nIf the task depends on these servers, connect to"
++                                             " them yourself via bash; the task text names their"
++                                             " endpoints and transports.")
++                tools = [BASH_TOOL]
++                mcp_tools, mcp_by_name = [], {}
++                reply = await call_model(model, messages, tools)
++            else:
+                 raise
+-            degraded = True
+-            mcp_notes.append("task tools dropped after %s: %s" % (type(exc).__name__, exc))
+-            messages[0]["content"] += ("\n\nMCP status: " + " ".join(mcp_notes)
+-                                       + "\nIf the task depends on these servers, connect to"
+-                                         " them yourself via bash; the task text names their"
+-                                         " endpoints and transports.")
+-            tools = [BASH_TOOL]
+-            mcp_tools, mcp_by_name = [], {}
+-            reply = await call_model(model, messages, tools)
+         messages.append(reply.message)
+         if not reply.tool_calls:
+-            if mcp_tools and not finish_checked:
+-                # One chance to deliver/terminate through the environment's own
+-                # tools; whatever comes back ends the run.
+-                finish_checked = True
+-                messages.append({"role": "user", "content": FINISH_CHECK})
++            # Bare text in a tool environment reaches no one. Nudge, escalate,
++            # and nudge once more if needed; whatever follows the last nudge
++            # (or a third bare reply) ends the run.
++            bare_streak += 1
++            if mcp_tools and bare_streak < 3 and nudges < 3:
++                nudges += 1
++                messages.append({"role": "user", "content": finish_check(
++                    1 if nudges == 1 else 2, delivery_seen, sorted(mcp_by_name))})
+                 continue
+             return
++        bare_streak = 0
+         for call in reply.tool_calls:
+             args = call.arguments if isinstance(call.arguments, dict) else {}
++            if call.name != "bash" and any(s in call.name.lower() for s in DELIVERY_STEMS):
++                delivery_seen = True
+             if call.name == "bash":
+                 out = await exec_bash(world, args)
+             elif call.name in mcp_by_name:

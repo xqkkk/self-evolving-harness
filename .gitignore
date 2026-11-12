@@ -1,0 +1,8 @@
+.env
+providers.json
+runs/
+datasets/
+.gaia2-judge-venv/
+__pycache__/
+*.pyc
+.venv/

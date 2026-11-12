@@ -1,0 +1,15 @@
+--- iteration04/harness.py
++++ iteration05/harness.py
+@@ -56,9 +56,9 @@
+ 
+ # These are character budgets, intentionally well below the model's token
+ # limit.  They leave room for tokenization differences and model output.
+-_CONTEXT_BUDGET = 100_000
+-_RETRY_BUDGETS = (_CONTEXT_BUDGET, 65_000, 40_000)
+-_TOOL_OUTPUT_LIMIT = 12_000
++_CONTEXT_BUDGET = 48_000
++_RETRY_BUDGETS = (_CONTEXT_BUDGET, 32_000, 20_000)
++_TOOL_OUTPUT_LIMIT = 8_000
+ # A model can accidentally spend the whole trial in one build, search, or
+ # package installation.  This is long enough for normal checks but leaves time
+ # to inspect a failure and choose a smaller or better staged approach.

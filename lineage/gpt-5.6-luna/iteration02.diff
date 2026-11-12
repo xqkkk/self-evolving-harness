@@ -1,0 +1,59 @@
+--- iteration01/harness.py
++++ iteration02/harness.py
+@@ -21,6 +21,10 @@
+     "in the expected location and run the most relevant affordable checks; for "
+     "research or data tasks, gather enough primary evidence and calculate or "
+     "cross-check the result. Do not stop merely because a command exited zero.\n"
++    "Keep expensive work bounded and recoverable: prefer staged experiments, "
++    "bounded searches, and checkpoints over one unbounded computation. If a "
++    "command fails or is cut short, use the diagnostic to revise the approach "
++    "rather than repeating the same command blindly.\n"
+     "If details are genuinely missing, make a clearly stated reasonable choice "
+     "when possible instead of stalling. Before finishing, verify that the "
+     "deliverable is present, correct, and in the requested format.\n"
+@@ -49,6 +53,10 @@
+ _CONTEXT_BUDGET = 480_000
+ _RETRY_BUDGETS = (_CONTEXT_BUDGET, 280_000, 140_000)
+ _TOOL_OUTPUT_LIMIT = 24_000
++# A model can accidentally spend the whole trial in one build, search, or
++# package installation.  This is long enough for normal checks but leaves time
++# to inspect a failure and choose a smaller or better staged approach.
++_COMMAND_TIMEOUT_S = 600
+ 
+ 
+ def _clip(text: str, limit: int = _TOOL_OUTPUT_LIMIT) -> str:
+@@ -158,14 +166,26 @@
+             return
+         for call in reply.tool_calls:
+             if call.name == "bash":
+-                r = await world.exec(str(call.arguments.get("command", "")))
+-                # Keep the complete outcome in the world recorder, but do not
+-                # let an accidental `cat` consume the entire next prompt.
+-                parts = [_clip(r.stdout)]
+-                if r.stderr:
+-                    parts.append("[stderr]\n" + _clip(r.stderr))
+-                parts.append(f"[exit {r.return_code}]")
+-                output = "\n".join(p for p in parts if p)
++                command = str(call.arguments.get("command", ""))
++                try:
++                    r = await world.exec(command, timeout_s=_COMMAND_TIMEOUT_S)
++                    # Keep the complete outcome in the world recorder, but do
++                    # not let an accidental `cat` consume the next prompt.
++                    parts = [_clip(r.stdout)]
++                    if r.stderr:
++                        parts.append("[stderr]\n" + _clip(r.stderr))
++                    parts.append(f"[exit {r.return_code}]")
++                    output = "\n".join(p for p in parts if p)
++                except Exception as exc:
++                    # A tool timeout or transport failure is evidence for the
++                    # model, not a reason to lose the entire agent run.  Do not
++                    # catch cancellation: the kernel must still end promptly
++                    # when the trial itself times out.
++                    output = (
++                        f"[tool error: {type(exc).__name__}: {exc}]\n"
++                        "The command did not complete; inspect any partial "
++                        "effects and choose a bounded recovery step."
++                    )
+             else:
+                 output = f"unknown tool: {call.name}"
+             messages.append(

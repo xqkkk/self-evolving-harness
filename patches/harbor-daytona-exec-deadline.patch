@@ -1,0 +1,46 @@
+diff --git a/src/harbor/environments/daytona/environment.py b/src/harbor/environments/daytona/environment.py
+index 813c8bd5..915dfaf2 100644
+--- a/src/harbor/environments/daytona/environment.py
++++ b/src/harbor/environments/daytona/environment.py
+@@ -1657,6 +1657,32 @@ class DaytonaEnvironment(ComposeServiceOpsMixin, BaseEnvironment):
+         timeout_sec: int | None = None,
+         shell: str = "bash -c",
+         user: str | int | None = None,
++    ) -> ExecResult:
++        # Remote GNU timeout bounds the command; independently bound session
++        # dispatch, status polling and log retrieval when the backend stalls.
++        # The grace permits remote termination/log flushing without extending
++        # the trial's externally enforced agent budget.
++        operation = self._sandbox_exec_unbounded(
++            command, cwd, env, timeout_sec, shell, user
++        )
++        if timeout_sec is None or timeout_sec <= 0:
++            return await operation
++        try:
++            return await asyncio.wait_for(operation, timeout=float(timeout_sec) + 10)
++        except TimeoutError as exc:
++            raise RuntimeError(
++                "Daytona command transport deadline exceeded after "
++                f"{timeout_sec}s plus 10s cleanup grace"
++            ) from exc
++
++    async def _sandbox_exec_unbounded(
++        self,
++        command: str,
++        cwd: str | None = None,
++        env: dict[str, str] | None = None,
++        timeout_sec: int | None = None,
++        shell: str = "bash -c",
++        user: str | int | None = None,
+     ) -> ExecResult:
+         """Execute a command directly on the Daytona sandbox VM.
+ 
+@@ -1698,7 +1724,7 @@ class DaytonaEnvironment(ComposeServiceOpsMixin, BaseEnvironment):
+                 command = f"env {env_args} {command}"
+ 
+             if timeout_sec:
+-                command = f"timeout {timeout_sec} {command}"
++                command = f"timeout -k 5 {timeout_sec} {command}"
+ 
+             if cwd:
+                 command = f"cd {cwd} && {command}"

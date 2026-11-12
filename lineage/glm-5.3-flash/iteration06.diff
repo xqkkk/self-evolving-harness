@@ -1,0 +1,284 @@
+--- iteration05/harness.py
++++ iteration06/harness.py
+@@ -67,12 +67,134 @@
+                    "properties": {"command": {"type": "string", "description": "The command to run."}},
+                    "required": ["command"]}}}
+ 
++VIEW_IMAGE_TOOL = {"type": "function", "function": {
++    "name": "view_image",
++    "description": ("Show a local image file to yourself inside the conversation, so you can actually"
++                    " see it. For video or PDFs, extract pages/frames to image files first (ffmpeg:"
++                    " every N seconds `-vf fps=1/N,scale=800:-1 f_%03d.jpg`, scene changes"
++                    " `-vf \"select=gt(scene\\,0.3),scale=800:-1\" -vsync vfr`, or a tiled contact sheet"
++                    " `-vf fps=1/N,scale=320:-1,tile=4x5 sheet.jpg`); then view those files. Use for any"
++                    " input you would need to look at: photos, screenshots, charts, diagrams, scoreboards."),
++    "parameters": {"type": "object",
++                   "properties": {"path": {"type": "string", "description": "Path of the image file inside the container."},
++                                  "max_side": {"type": "integer", "description": "Downscale so the longer side is at most this many pixels (default 1024)."}},
++                   "required": ["path"]}}}
++
++# Attached images are counted at a token-equivalent weight, not their base64
++# length: vision encoders bill an image at hundreds-to-low-thousands of tokens
++# regardless of byte size, while the base64 text is ~100-250k chars - counting
++# it verbatim would make one picture look like half a context window.
++IMG_CHAR_COST = 60_000
++IMG_KEEP = 4              # newest attached images kept in history; older are pruned
++
++_IMAGE_SNIPPET = r'''
++import base64, io, sys
++p, ms = sys.argv[1], int(sys.argv[2])
++raw = open(p, "rb").read()
++ext = p.rsplit(".", 1)[-1].lower() if "." in p else "png"
++fmt = {"jpg": "jpeg", "jpeg": "jpeg", "png": "png", "gif": "gif", "webp": "webp", "bmp": "bmp"}.get(ext, "png")
++data = raw
++try:
++    from PIL import Image
++    im = Image.open(io.BytesIO(raw)).convert("RGB")
++    w, h = im.size
++    s = max(w, h)
++    if s > ms:
++        im = im.resize((max(1, w * ms // s), max(1, h * ms // s)))
++    for side in (ms, min(ms, 640)):
++        w2, h2 = im.size
++        s2 = max(w2, h2)
++        im2 = im.resize((max(1, w2 * side // s2), max(1, h2 * side // s2))) if s2 > side else im
++        b = io.BytesIO()
++        im2.save(b, "JPEG", quality=80 if side == ms else 55)
++        data, fmt = b.getvalue(), "jpeg"
++        if len(b.getvalue()) <= 700000:
++            break
++except Exception:
++    pass
++sys.stdout.write("OK %s %s" % (fmt, base64.b64encode(data).decode()))
++'''
++
++_IMAGE_NOTE = ("[harness] The gateway rejected the attached image(s), so they were removed from the"
++               " conversation. Pictures cannot be shown on this run: analyze media with in-container"
++               " tools instead (ffmpeg frame extraction and filters, PIL pixel statistics, any OCR/"
++               "captioning service the task provides) and reason from their textual output.")
++
++VIEW_RESULT = "view_image: image loaded from %s (%s, downscaled); it is attached below as a picture you can see."
++
++
++def _image_user_message(imgs):
++    """One user message carrying this turn's attached images (text part first)."""
++    content = [{"type": "text", "text": "[harness] Attached image(s) you asked to view:"}]
++    for fmt, b64 in imgs:
++        content.append({"type": "image_url", "image_url": {"url": "data:image/%s;base64,%s" % (fmt, b64)}})
++    return {"role": "user", "content": content}
++
++
++def _image_parts(messages):
++    """Yield (message, index) for every attached image part in the history."""
++    for m in messages:
++        c = m.get("content")
++        if isinstance(c, list):
++            for j, part in enumerate(c):
++                if isinstance(part, dict) and part.get("type") == "image_url":
++                    yield m, j
++
++
++def _replace_image_part(m, j, note):
++    m["content"][j] = {"type": "text", "text": note}
++
++
++def _prune_images(messages, keep=IMG_KEEP):
++    parts = list(_image_parts(messages))
++    for m, j in parts[:-keep] if keep else parts:
++        _replace_image_part(m, j, "[earlier image removed to save context]")
++
++
++def _strip_all_images(messages):
++    for m, j in list(_image_parts(messages)):
++        _replace_image_part(m, j, "[image could not be displayed]")
++
++
++async def view_image(world, args):
++    """Load a container-side image, downscale it, and hand it back for attachment."""
++    path = args.get("path") if isinstance(args, dict) else None
++    if not isinstance(path, str) or not path.strip():
++        return "view_image error: no path given"
++    try:
++        ms = max(256, min(2048, int(args.get("max_side") or 1024)))
++    except Exception:
++        ms = 1024
++    q = shlex.quote
++    enc = "%s -c %s" % (PY_CMD, q(_IMAGE_SNIPPET))
++    # PIL-first with an ffmpeg fallback (which also turns a stray video/PDF
++    # argument into its first frame/page instead of failing outright).
++    cmd = ("OUT=$(%s %s %s 2>/dev/null); case \"$OUT\" in 'OK '*) printf '%%s' \"$OUT\"; exit 0;; esac; "
++           "ffmpeg -v error -y -i %s -vf scale='min(%d,iw)':-2 /tmp/.harness_view.jpg 2>/dev/null"
++           " && %s /tmp/.harness_view.jpg %s 2>/dev/null" % (enc, q(path), ms, q(path), ms, enc, ms))
++    try:
++        r = await asyncio.wait_for(world.exec(cmd, timeout_s=90), timeout=90)
++    except Exception as exc:
++        return "view_image error: %s: %s" % (type(exc).__name__, exc)
++    out = (r.stdout or "").strip()
++    if not out.startswith("OK ") or len(out) < 100:
++        return ("view_image error: could not read %r. If it is a video or PDF, extract frames/pages"
++                " to image files first (ffmpeg -i v.mp4 -vf fps=1/2 f_%%03d.jpg; pdftoppm for PDFs),"
++                " then view those." % path[:200])
++    try:
++        fmt, b64 = out[3:].split(" ", 1)
++    except ValueError:
++        return "view_image error: bad encoder output"
++    if not fmt or len(b64) > 1_600_000:
++        return "view_image error: image too large to attach; extract a smaller frame (scale=640:-1) and view that."
++    return {"format": fmt, "b64": b64, "path": path}
++
+ SYSTEM_PROMPT = """You are an autonomous agent completing a task in a Linux container. Work through tool calls
+ until the task is done, then reply with a final message and no tool calls.
+ 
+ Working method:
+ 1. Pin down the deliverable before acting: exactly what artifact, answer, or effect is required (file paths, formats, names, recipients), and any constraints or acceptance criteria the task states.
+-2. Inventory before you build: look at the working directory, the inputs, and what is already installed (interpreters, packages, CLI tools); prefer what exists over downloading or rebuilding; sample data formats before parsing.
++2. Inventory before you build: look at the working directory, the inputs, and what is already installed (interpreters, packages, CLI tools); prefer what exists over downloading or rebuilding; sample data formats before parsing. If inputs include images, video, or PDFs, inspect them early - extract frames/pages (ffmpeg, pdftoppm) and use the view_image tool to actually look at them, rather than inferring from names, metadata, or pixel arithmetic.
+ 3. Work in small verified steps: run a command, read the result, adjust. When something fails, read the actual error and change something - do not repeat the same call expecting a different result.
+ 4. Be economical with output: search and slice (grep -n, sed -n, head, tail) instead of dumping whole files; batch related commands into one call.
+ 
+@@ -83,10 +205,10 @@
+    use, kill) or detach it (`setsid nohup CMD >log 2>&1 </dev/null &`) and
+    poll the log or port in later calls; wrap anything that could block in
+    `timeout Ns` so a hang costs seconds, never the run.
+-5. Checkpoint the deliverable: as soon as a required artifact exists in acceptable form, write it to the requested location; refine afterwards if time allows. Never leave a task without its deliverable in place.
++5. Checkpoint the deliverable: as soon as a required artifact exists in acceptable form, write it to the requested location; refine afterwards if time allows. Never leave a task without its deliverable in place. The deliverable may be a file, a sent message, or your final reply - find out which and bank a defensible version of it early, then improve it. If part of the task cannot be done here (a tool, file, or network resource is missing), do not burn the budget trying to obtain it: deliver the best answer the environment allows and say plainly what is missing.
+ 6. Verify before finishing: re-read the task's requirements and check each against what you actually produced (exact path, exact format, the value actually asked for); if a checker or test suite exists, run it. When the deliverable is a specific value, re-derive it once by an independent method before answering: carry full precision through intermediate steps, watch units and rounding conventions, and round only at the final step, exactly as the task asks.
+ 7. When the task asks a question, make your final message state the exact answer plainly - the precise value, name, or phrase requested - not just reasoning around it.
+-8. Deliver through the environment's own channels: if the task provides tools for sending messages, submitting, saving, or terminating (or names a required file or channel), perform those acts with those tools; a plain-text reply reaches no one and simply ends the run. If a requirement is genuinely ambiguous and you can ask the user a question, ask one concise question early; otherwise proceed on the most conservative reading and state your assumption. Before finishing, check whether the instructions define an ending protocol (a stop token, or an end/terminate/submit call) and perform it.
++8. Deliver through the environment's own channels: if the task provides tools for sending messages, submitting, saving, or terminating (or names a required file or channel), perform those acts with those tools; a plain-text reply reaches no one and simply ends the run. If a requirement is genuinely ambiguous and you can ask the user a question, ask one concise question early; otherwise proceed on the most conservative reading and state your assumption. If the task describes an interactive protocol (a person or service that replies, a limited number of exchanges), the interaction itself is part of the work: use the channel as the task spells out instead of answering from assumptions. Before finishing, check whether the instructions define an ending protocol (a stop token, or an end/terminate/submit call) and perform it.
+ 
+ Each tool result is clipped if very long (a marker shows what was dropped) and ends with the run's elapsed wall-clock time. Use that to pace yourself: your total budget is unknown and varies by task, so earn margin early - front-load the inventory, treat long installs, builds, or training runs as the wrong trade, and keep the deliverable present and valid in its required location from the first minutes so the run could end cleanly at any moment. As elapsed time grows, shift from exploring to finishing and verifying. Keep reasoning bursts short: prefer a small tool call now over long uninterrupted deliberation - you learn more per token from a tool result than from speculation, and very long single calls waste wall clock and can be cut off. If a reply of yours is ever cut off, or a single call runs many minutes, treat that as a signal to shrink every later reply to one small action and to move computation into scripts the machine runs instead of working it out in your head.
+ 
+@@ -364,7 +486,26 @@
+     if r.stderr:
+         parts.append("[stderr]\n" + r.stderr)
+     parts.append("[exit %s]" % r.return_code)
+-    return "\n".join(p for p in parts if p)
++    text = "\n".join(p for p in parts if p)
++    low = text.lower()
++    cmd_low = command.lower()
++    installer = any(t in cmd_low for t in ("apt-get", "apt install", "apt-get install", "pip install",
++                                           "pip3 install", "conda install", "npm install", "gem install",
++                                           "cargo install", "apk add", "dnf install", "yum install"))
++    failed = any(s in low for s in ("unable to locate package", "failed to fetch", "temporary failure resolving",
++                                    "could not resolve host", "no matching distribution", "could not find a version",
++                                    "network is unreachable", "could not connect", "connection refused"))
++    if installer and failed and not state.get("net_dead"):
++        # Every failed install costs a minute or more, and trials have burned a
++        # third of their budget re-probing dead package sources.
++        text += (" [harness] That install failed at the package source. Probe the network once, briefly;"
++                 " if it is unavailable, stop attempting installs - they cannot succeed here. Work with"
++                 " what is already installed (python stdlib, preinstalled binaries, the task's own local"
++                 " services); a missing capability is not a reason to stop.")
++        state["net_dead"] = True
++    elif installer and failed and state.get("net_dead"):
++        text += " [no network: installs will not work here]"
++    return text
+ 
+ 
+ def _is_context_error(text):
+@@ -406,6 +547,11 @@
+                 a = (tc.get("function") or {}).get("arguments")
+                 if isinstance(a, str) and len(a) > 1000:
+                     tc["function"]["arguments"] = _trim_arguments(a)
++        if isinstance(m.get("content"), list):
++            # Old attached pictures are stale too: keep the text, drop the bytes.
++            for j, part in list(enumerate(m["content"])):
++                if isinstance(part, dict) and part.get("type") == "image_url":
++                    _replace_image_part(m, j, "[earlier image removed to save context]")
+ 
+ 
+ def _drop_replay(m):
+@@ -421,8 +567,21 @@
+     """Estimate what a request really weighs: every serialized message field,
+     not just ``content``. Tool-call arguments (whole files written inline) and
+     the replayed reasoning blobs are invisible to a content-only count yet
+-    they are what filled the context window in the trials that died."""
+-    return sum(len(json.dumps(m, default=str)) for m in messages)
++    they are what filled the context window in the trials that died. Attached
++    images count at their token-equivalent weight, not their base64 length."""
++    total = 0
++    for m in messages:
++        c = m.get("content")
++        if isinstance(c, list):
++            total += len(json.dumps({k: v for k, v in m.items() if k != "content"}, default=str))
++            for part in c:
++                if isinstance(part, dict) and part.get("type") == "image_url":
++                    total += IMG_CHAR_COST
++                else:
++                    total += len(json.dumps(part, default=str))
++        else:
++            total += len(json.dumps(m, default=str))
++    return total
+ 
+ 
+ def _maybe_compact(messages):
+@@ -539,6 +698,19 @@
+                 else:
+                     _shrink_history(messages)
+                 continue
++            if list(_image_parts(messages)) and any(
++                    s in text for s in ("image", "media", "multimodal", "content part", "data url",
++                                        "invalid", "unsupported", "not supported", "reject",
++                                        "400", "413", "415", "422")):
++                # The request that just failed carried picture parts the
++                # gateway would not take (or malformed ones). Strip them once
++                # and carry on text-only instead of dying here; transient
++                # failures (5xx, timeouts, rate limits) do not match and keep
++                # the images.
++                attempt += 1
++                _strip_all_images(messages)
++                messages.append({"role": "user", "content": _IMAGE_NOTE})
++                continue
+             if _is_cutoff(text):
+                 state["stalled"] = True
+                 if cutoffs < 2:
+@@ -573,7 +745,7 @@
+                    + "\nIf the task depends on these servers, connect to them yourself via"
+                      " bash; the task text names their endpoints and transports.")
+     mcp_by_name = {t["tool_name"]: t for t in mcp_tools}
+-    tools = [BASH_TOOL] + [
++    tools = [BASH_TOOL, VIEW_IMAGE_TOOL] + [
+         {"type": "function", "function": {"name": t["tool_name"], "description": t["description"],
+                                           "parameters": t["parameters"]}} for t in mcp_tools]
+ 
+@@ -583,6 +755,7 @@
+     state = {"stalled": False,   # generations being cut off / sampled for many minutes
+              "tool_calls": 0,    # completed tool calls; selects the watchdog deadline
+              "exec_hung": False} # an exec was killed at the cap; ride the hang-watch note
++    pending_images = []   # (format, b64) loaded by view_image this turn; attached after tool results
+     nudges = 0            # finish-check nudges spent over the whole run
+     bare_streak = 0       # consecutive replies without a tool call
+     delivery_seen = False # a delivery/termination-style tool has been called
+@@ -615,7 +788,7 @@
+                                            + "\nIf the task depends on these servers, connect to"
+                                              " them yourself via bash; the task text names their"
+                                              " endpoints and transports.")
+-                tools = [BASH_TOOL]
++                tools = [BASH_TOOL, VIEW_IMAGE_TOOL]
+                 mcp_tools, mcp_by_name = [], {}
+                 reply = await call_model(model, messages, tools, state)
+             else:
+@@ -646,6 +819,11 @@
+                 delivery_seen = True
+             if call.name == "bash":
+                 out = await exec_bash(world, args, t0, state)
++            elif call.name == "view_image":
++                out = await view_image(world, args)
++                if isinstance(out, dict):
++                    pending_images.append((out["format"], out["b64"]))
++                    out = VIEW_RESULT % (out["path"], out["format"])
+             elif call.name in mcp_by_name:
+                 out = await call_mcp(world, mcp_by_name[call.name], args)
+             else:
+@@ -673,3 +851,10 @@
+                              + (HANG_NOTE if state["exec_hung"] else "")
+                              + "\n" + time_tag(t0)})
+             _maybe_compact(messages)
++        if pending_images:
++            # Attach after the tool results, so the replay chain stays intact:
++            # assistant(tool_calls) -> tool results -> one user message with pictures.
++            messages.append(_image_user_message(pending_images))
++            pending_images = []
++            _prune_images(messages)
++            _maybe_compact(messages)

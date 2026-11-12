@@ -1,0 +1,4 @@
+terminal-bench/distribution-search
+terminal-bench/build-pmars
+terminal-bench/torch-tensor-parallelism
+terminal-bench/crack-7z-hash

@@ -1,0 +1,60 @@
+--- iteration03/harness.py
++++ iteration04/harness.py
+@@ -28,8 +28,12 @@
+     "command fails or is cut short, use the diagnostic to revise the approach "
+     "rather than repeating the same command blindly.\n"
+     "If details are genuinely missing, make a clearly stated reasonable choice "
+-    "when possible instead of stalling. Before finishing, verify that the "
+-    "deliverable is present, correct, and in the requested format.\n"
++    "when possible instead of stalling. At the start, form a short plan and "
++    "keep a checklist of evidence still needed; update it after each action "
++    "and stop only when the deliverable and its checks are complete.\n"
++    "For state-changing or interactive operations, separate lookup from action, "
++    "check identity, arguments, and authorization, then inspect resulting state.\n"
++    "Before finishing, verify that the deliverable is present, correct, and in the requested format.\n"
+     "When the task is done, reply with a concise final message and no tool calls."
+ )
+ 
+@@ -52,13 +56,14 @@
+ 
+ # These are character budgets, intentionally well below the model's token
+ # limit.  They leave room for tokenization differences and model output.
+-_CONTEXT_BUDGET = 180_000
+-_RETRY_BUDGETS = (_CONTEXT_BUDGET, 110_000, 70_000)
+-_TOOL_OUTPUT_LIMIT = 16_000
++_CONTEXT_BUDGET = 100_000
++_RETRY_BUDGETS = (_CONTEXT_BUDGET, 65_000, 40_000)
++_TOOL_OUTPUT_LIMIT = 12_000
+ # A model can accidentally spend the whole trial in one build, search, or
+ # package installation.  This is long enough for normal checks but leaves time
+ # to inspect a failure and choose a smaller or better staged approach.
+ _COMMAND_TIMEOUT_S = 240
++_REVIEW_EVERY = 12
+ 
+ 
+ def _clip(text: str, limit: int = _TOOL_OUTPUT_LIMIT) -> str:
+@@ -170,12 +175,24 @@
+         {"role": "system", "content": SYSTEM_PROMPT},
+         {"role": "user", "content": instruction},
+     ]
++    tool_steps = 0
+     while True:
++        if tool_steps and tool_steps % _REVIEW_EVERY == 0:
++            messages.append({
++                "role": "user",
++                "content": (
++                    "Progress review: reassess the original deliverable and your "
++                    "evidence checklist. Identify the next highest-value bounded "
++                    "step, or finish if the result is already verified; avoid "
++                    "repeating an unproductive experiment."
++                ),
++            })
+         reply = await _chat(model, messages)
+         messages.append(reply.message)
+         if not reply.tool_calls:
+             return
+         for call in reply.tool_calls:
++            tool_steps += 1
+             if call.name == "bash":
+                 command = str(call.arguments.get("command", ""))
+                 try:

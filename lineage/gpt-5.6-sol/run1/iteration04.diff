@@ -1,0 +1,101 @@
+--- iteration03/harness.py
++++ iteration04/harness.py
+@@ -1,5 +1,5 @@
++import base64
+ import json
+-import mimetypes
+ import re
+ import shlex
+ 
+@@ -18,8 +18,9 @@
+ - Verify exact names, dates, units, formats, destinations, and side effects before finishing. Check final state through an authoritative read, not just a command's success message. If blocked, try reasonable alternatives and leave the best valid partial result.
+ - For ambiguous requests, distinguish details that can be discovered safely from choices that materially change the outcome. Investigate the former; ask one focused question about the latter before acting.
+ - For multi-part or interactive work, keep a checklist of requested outcomes and policy gates. After each state change, record what actually succeeded. Do not silently drop an item, claim an unobserved result, repeat an irreversible action, or perform plausible extras the user did not request.
+-- For event-driven or time-sensitive work, model the request as a state machine. Record an authoritative baseline and target time before waiting; notifications are wake-ups, not proof that the deadline or condition was met. At the trigger, reread the clock and relevant state, compute changes by stable identifiers, then apply each conditional branch exactly once.
++- For event-driven or time-sensitive work, model the request as a state machine. Record an authoritative baseline and target time before waiting; notifications are wake-ups, not proof that the deadline or condition was met. Recompute remaining time after every wake-up and poll conservatively near an exact deadline rather than letting one imprecise wait span it. At the trigger, reread the clock and relevant state, compute changes by stable identifiers, and apply each conditional branch exactly once. Do not act on one item in a stream when the branch requires a condition over the whole set.
+ - For calculations and document research, preserve a short provenance chain from source location and table headers through units, operands, formula, and final formatting. Search for revisions and competing matches, and independently recompute rather than trusting a plausible first result.
++- For open-ended search, define the answer shape and decisive evidence before querying. Batch independent lookups when possible; after two unproductive variants, change the source or hypothesis instead of repeating near-identical searches.
+ - For substantial repository changes, translate the request into a contract matrix (behavior, integration points, edge cases, and evidence). Trace each requested behavior to production code, test the externally observable path, and inspect the final diff for omissions and accidental scope.
+ 
+ MCP application tools, when present, are exposed directly by name. Call them directly; do not implement an MCP client with bash. Follow task-specific interaction and termination rules exactly, inspect notifications, and avoid unnecessary user-facing messages. Search documentation with narrow questions and synthesize the evidence before acting rather than repeatedly browsing.
+@@ -47,7 +48,7 @@
+     "type": "function",
+     "function": {
+         "name": "view_image",
+-        "description": "Attach an image file from the task container so you can visually inspect it. Use this instead of trying to decode pixels manually.",
++        "description": "Attach a valid PNG, JPEG, GIF, or WebP under 200 KB for visual inspection. Convert other formats and use a crop or thumbnail; do not decode pixels manually.",
+         "parameters": {
+             "type": "object",
+             "properties": {"path": {"type": "string", "description": "Absolute or working-directory-relative image path."}},
+@@ -85,11 +86,12 @@
+ 
+ 
+ def _terminal_tool(name):
+-    normalized = re.sub(r"[^a-z]+", "_", name.lower())
+-    return ("termination" in normalized or bool(re.search(
+-        r"(?:end|finish|terminate|stop).*(?:conversation|session|interaction|run)",
+-        normalized,
+-    )))
++    """Match explicit lifecycle controls, not substrings such as sEND_message."""
++    expanded = re.sub(r"([a-z0-9])([A-Z])", r"\1_\2", name)
++    words = [w for w in re.split(r"[^a-z]+", expanded.lower()) if w]
++    actions = {"end", "finish", "terminate", "stop", "termination"}
++    objects = {"conversation", "session", "interaction", "run", "chat", "dialogue", "task"}
++    return "termination" in words or bool(actions.intersection(words) and objects.intersection(words))
+ 
+ 
+ def _tool_schema(item):
+@@ -173,7 +175,22 @@
+     if len(data) > 200_000:
+         return None, ("Image is too large to attach safely. Create a thumbnail or a "
+                       "compressed crop below 200 KB, then call view_image on that file.")
+-    mime = mimetypes.guess_type(path)[0] or "image/png"
++    # The model endpoint accepts only these formats. Do not label arbitrary bytes
++    # as PNG: provider-side validation would otherwise abort the entire run.
++    raw = base64.b64decode(data)
++    if raw.startswith(b"\x89PNG\r\n\x1a\n"):
++        mime = "image/png"
++    elif raw.startswith(b"\xff\xd8\xff"):
++        mime = "image/jpeg"
++    elif raw.startswith((b"GIF87a", b"GIF89a")):
++        mime = "image/gif"
++    elif raw.startswith(b"RIFF") and raw[8:12] == b"WEBP":
++        mime = "image/webp"
++    else:
++        mime = None
++    if not mime:
++        return None, ("Unsupported image encoding. Convert the file to a valid PNG, "
++                      "JPEG, GIF, or WebP thumbnail below 200 KB, then try again.")
+     return {"type": "input_image", "image_url": f"data:{mime};base64,{data}"}, "Image attached for visual inspection."
+ 
+ 
+@@ -195,7 +212,10 @@
+         except Exception as exc:
+             # A provider can count encoded media more harshly than its character
+             # length suggests. Recover once rather than losing all completed work.
+-            if "context_length" not in str(exc).lower() and "context window" not in str(exc).lower():
++            error = str(exc).lower()
++            recoverable_media = ("context_length" in error or "context window" in error
++                                 or "image data" in error or "invalid image" in error)
++            if not recoverable_media:
+                 raise
+             changed = False
+             for message in messages[2:]:
+@@ -210,7 +230,7 @@
+             if not changed:
+                 raise
+             messages.append({"role": "system", "content":
+-                "The previous request exceeded the context because of visual data. Continue from the retained evidence; attach only small crops or thumbnails."})
++                "The provider rejected the previous request's visual data. Continue from retained evidence; if needed, create a small, valid PNG/JPEG/GIF/WebP crop."})
+             continue
+         messages.append(reply.message)
+         if not reply.tool_calls:
+@@ -254,7 +274,7 @@
+                 elif call.name in routes:
+                     url, sid, actual_name = routes[call.name]
+                     output = _clip(await mcp_bridge.call(world, url, sid, actual_name, call.arguments))
+-                    if _terminal_tool(actual_name) and not output.startswith(("MCP error:", "MCP tool reported an error:")):
++                    if _terminal_tool(actual_name) and not output.startswith(("MCP error:", "MCP transport error:", "MCP tool reported an error:")):
+                         terminal_action = True
+                 else:
+                     output = f"Unknown tool: {call.name}"

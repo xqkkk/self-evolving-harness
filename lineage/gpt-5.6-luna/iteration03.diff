@@ -1,0 +1,49 @@
+--- iteration02/harness.py
++++ iteration03/harness.py
+@@ -22,7 +22,9 @@
+     "research or data tasks, gather enough primary evidence and calculate or "
+     "cross-check the result. Do not stop merely because a command exited zero.\n"
+     "Keep expensive work bounded and recoverable: prefer staged experiments, "
+-    "bounded searches, and checkpoints over one unbounded computation. If a "
++    "bounded searches, and checkpoints over one unbounded computation. For "
++    "long tasks, leave a small useful checkpoint in the task workspace so "
++    "you can resume after context is pruned. If a "
+     "command fails or is cut short, use the diagnostic to revise the approach "
+     "rather than repeating the same command blindly.\n"
+     "If details are genuinely missing, make a clearly stated reasonable choice "
+@@ -50,13 +52,13 @@
+ 
+ # These are character budgets, intentionally well below the model's token
+ # limit.  They leave room for tokenization differences and model output.
+-_CONTEXT_BUDGET = 480_000
+-_RETRY_BUDGETS = (_CONTEXT_BUDGET, 280_000, 140_000)
+-_TOOL_OUTPUT_LIMIT = 24_000
++_CONTEXT_BUDGET = 180_000
++_RETRY_BUDGETS = (_CONTEXT_BUDGET, 110_000, 70_000)
++_TOOL_OUTPUT_LIMIT = 16_000
+ # A model can accidentally spend the whole trial in one build, search, or
+ # package installation.  This is long enough for normal checks but leaves time
+ # to inspect a failure and choose a smaller or better staged approach.
+-_COMMAND_TIMEOUT_S = 600
++_COMMAND_TIMEOUT_S = 240
+ 
+ 
+ def _clip(text: str, limit: int = _TOOL_OUTPUT_LIMIT) -> str:
+@@ -149,7 +151,16 @@
+         except Exception as exc:
+             last = exc
+             text = str(exc).lower()
+-            if "context" not in text and "maximum" not in text:
++            # A provider-side prompt safety classifier can also reject a
++            # long history containing arbitrary task data.  A smaller,
++            # recent-only retry often removes the offending stale transcript;
++            # do not turn this into an unbounded retry loop.
++            retryable = (
++                "context" in text
++                or "maximum" in text
++                or "invalid_prompt" in text
++            )
++            if not retryable:
+                 raise
+     raise last
+ 

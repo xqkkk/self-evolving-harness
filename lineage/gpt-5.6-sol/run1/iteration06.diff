@@ -1,0 +1,128 @@
+--- iteration05/harness.py
++++ iteration06/harness.py
+@@ -2,6 +2,7 @@
+ import json
+ import re
+ import shlex
++import time
+ 
+ from . import mcp_bridge
+ 
+@@ -23,6 +24,7 @@
+ - For event-driven or time-sensitive work, model the request as a state machine. Anchor each deadline to the timestamp of the specified triggering action, not to a later observation. Before every wait, reread the clock and cap the wait at the remaining interval; a notification is only a wake-up, not proof that the deadline was met. At the boundary, exclude observations timestamped after the cutoff, reread authoritative state, compute the complete change set by stable ID, and apply each conditional branch exactly once. Do not act on one stream item when the branch requires the whole set.
+ - For calculations and document research, preserve a short provenance chain from source location and table headers through units, operands, formula, and final formatting. Confirm period convention, population/sample definition, category, and revision before combining values; do not silently mix releases or granularities. Search for competing matches and independently recompute rather than trusting a plausible first result.
+ - For open-ended search, define the answer shape and decisive evidence before querying. Batch independent lookups when possible; after two unproductive variants, change the source or hypothesis instead of repeating near-identical searches.
++- For image or video work, inspect coarse-to-fine: build a timestamped inventory from compact contact sheets, then refine only candidate intervals or crops. Keep an evidence table as you go, request no more than four images at once, and create the required deliverable before spending time on optional polish.
+ - For substantial repository changes, maintain a contract matrix in the progress ledger with one row per behavior: production owner/call path, edge cases, implementation state, and external evidence. Trace every row through production code, test observable integration rather than only helpers, and inspect the final diff for omissions and accidental scope.
+ 
+ MCP application tools, when present, are exposed directly by name. Call them directly; do not implement an MCP client with bash. Follow task-specific interaction and termination rules exactly, inspect notifications, and avoid unnecessary user-facing messages. Search documentation with narrow questions and synthesize the evidence before acting rather than repeatedly browsing.
+@@ -105,6 +107,22 @@
+             "parameters": item.get("inputSchema") or {"type": "object", "properties": {}},
+         },
+     }
++
++
++def _omit_consumed_visuals(messages):
++    """An image has served its purpose once the model has answered that turn.
++
++    Keeping data URLs in subsequent requests pays their large context cost again and
++    can make one ambitious contact-sheet batch poison the rest of a run.
++    """
++    for message in messages[2:]:
++        content = message.get("content")
++        if isinstance(content, list) and any(
++            isinstance(part, dict) and part.get("type") == "input_image"
++            for part in content
++        ):
++            message["content"] = "[Previously inspected visual attachments omitted.]"
++            message.pop("_responses_items", None)
+ 
+ 
+ def _shrink_history(messages):
+@@ -209,11 +227,33 @@
+     terminal_action = False
+     model_calls = 0
+     policy_retries = 0
++    visual_inspections = 0
++    visual_budget_noted = False
++    review_started = None
++    review_calls = 0
++    review_deadline_noted = False
+     while True:
+         messages = _shrink_history(messages)
++        active_tools = tools
++        if visual_inspections >= 24:
++            active_tools = [t for t in tools if t["function"]["name"] != "view_image"]
++            if not visual_budget_noted:
++                messages.append({"role": "system", "content":
++                    "The visual inspection budget is exhausted. Synthesize the evidence already gathered, produce and validate every requested artifact now, and finish; do not generate more review frames."})
++                visual_budget_noted = True
++        if review_started is not None and (
++            time.monotonic() - review_started > 150 or review_calls >= 8
++        ):
++            active_tools = []
++            if not review_deadline_noted:
++                messages.append({"role": "system", "content":
++                    "The independent review window is over. Stop investigating and give the final response now, accurately reporting the best validated artifact or result already present."})
++                review_deadline_noted = True
+         try:
+-            reply = await model.chat(messages, tools=tools)
++            reply = await model.chat(messages, tools=active_tools)
+             model_calls += 1
++            if review_started is not None:
++                review_calls += 1
+         except Exception as exc:
+             # A provider can count encoded media more harshly than its character
+             # length suggests. Recover once rather than losing all completed work.
+@@ -245,6 +285,9 @@
+             messages.append({"role": "system", "content":
+                 "The provider rejected the previous request's visual data. Continue from retained evidence; if needed, create a small, valid PNG/JPEG/GIF/WebP crop."})
+             continue
++        # The reply has incorporated any visual input from this turn. Retain its
++        # reasoning/tool request, but do not resend bulky image bytes indefinitely.
++        _omit_consumed_visuals(messages)
+         messages.append(reply.message)
+         if not reply.tool_calls:
+             # Once the environment has been explicitly closed, an extra audit can
+@@ -259,6 +302,7 @@
+                     messages.append({"role": "system", "content":
+                         "Completion audit: compare authoritative current state with every requested outcome, condition, and policy gate. Check timestamps and notifications when relevant. Do not repeat side effects. If the task has a required communication or termination tool, use it exactly as instructed; if it already terminated, return only the required stop response."})
+                 else:
++                    review_started = time.monotonic()
+                     # A fresh context is a less anchored reviewer and avoids paying
+                     # repeatedly for a long implementation trajectory. The artifacts
+                     # and original contract are sufficient to audit local work.
+@@ -270,12 +314,16 @@
+                 continue
+             return
+         extra_images = []
++        turn_visuals = 0
+         for call in reply.tool_calls:
+             extra_image = None
+             try:
+                 if call.name == "bash":
+                     command = str(call.arguments.get("command", ""))
+                     timeout = max(1, min(int(call.arguments.get("timeout_s") or 600), 1800))
++                    if review_started is not None:
++                        remaining = max(1, int(150 - (time.monotonic() - review_started)))
++                        timeout = min(timeout, remaining)
+                     r = await world.exec(command, timeout_s=timeout)
+                     parts = [r.stdout]
+                     if r.stderr:
+@@ -283,7 +331,15 @@
+                     parts.append(f"[exit {r.return_code}]")
+                     output = _clip("\n".join(p for p in parts if p))
+                 elif call.name == "view_image":
+-                    extra_image, output = await _view_image(world, str(call.arguments.get("path", "")))
++                    if visual_inspections >= 24:
++                        output = "Visual inspection budget exhausted; use existing evidence and finish the deliverable."
++                    elif turn_visuals >= 4:
++                        output = "Per-turn attachment limit reached; inspect the attached images before requesting another small batch."
++                    else:
++                        extra_image, output = await _view_image(world, str(call.arguments.get("path", "")))
++                        if extra_image:
++                            turn_visuals += 1
++                            visual_inspections += 1
+                 elif call.name in routes:
+                     url, sid, actual_name = routes[call.name]
+                     output = _clip(await mcp_bridge.call(world, url, sid, actual_name, call.arguments))

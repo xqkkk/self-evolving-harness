@@ -1,0 +1,175 @@
+--- iteration02/harness.py
++++ iteration03/harness.py
+@@ -17,9 +17,11 @@
+ - Bash output is clipped when very large. Use targeted grep/find, sed ranges, summaries, or redirect output to a file instead of dumping entire trees, generated files, binaries, or logs.
+ - If application/MCP tools are present, call those tools directly. Use them to obtain current state before acting, respect confirmation and authorization requirements in the task, and verify state-changing operations. Do not build a second MCP client in bash when direct tools are available. Tool availability is not permission: never invoke setup, evaluation, administrative, or destructive operations merely because they are exposed.
+ - Treat explicit task protocols as hard constraints. Keep an observe-decide-act loop: inspect each result before choosing the next consequential action. Parallelize only independent read-only queries; perform writes, messages, purchases, bookings, deletions, and other state changes one at a time so failures and changed state can be observed.
+-- When uncertainty is resolvable from local evidence or tools, resolve it. Ask the user only when a consequential ambiguity truly cannot be resolved and the environment supports interaction.
+-- For software changes, prefer the smallest patch that satisfies the stated behavior and fits existing abstractions. Do not broaden the redesign speculatively. Run the closest existing tests, inspect the final diff for accidental files and unrelated changes, and distinguish tests actually run from checks that were unavailable.
+-- Before finishing, re-read the request, check every deliverable path and constraint, and run a final concise verification. In your final response state what was completed and any material limitation; do not claim checks you did not run.
++- When uncertainty is resolvable from local evidence or tools, resolve it. Ask the user only when a consequential ambiguity truly cannot be resolved and the environment supports interaction. Keep independent, unambiguous parts moving while a clarification is pending; do not silently choose among materially different interpretations.
++- Maintain a short mental ledger of the requested outcomes, exact constraints, unresolved facts, and completed actions. Reconcile it whenever a tool result or new user turn changes the state instead of following a stale plan.
++- For software changes, translate the request into observable behaviors before editing. Prefer the smallest patch that satisfies all of them and fits existing abstractions; do not broaden the redesign speculatively. Run the closest existing tests, inspect the final diff for accidental files and unrelated changes, and distinguish tests actually run from checks that were unavailable.
++- For generated, recovered, or transformed artifacts, validate with an independent reader or invariant when possible rather than trusting the producing script's own success message.
++- Before finishing, re-read the original request, check every deliverable path and constraint, and run a final concise verification. In your final response state what was completed and any material limitation; do not claim checks you did not run.
+ 
+ Never cheat: do not obtain an answer from an upstream fix, published solution, hidden tests, evaluation artifacts, or other source that already carries the task's answer. Ordinary documentation and installed library source are allowed. Solve the task yourself.
+ """
+@@ -52,6 +54,7 @@
+ }
+ 
+ MAX_RESULT_CHARS = 60000
++MAX_MCP_RESULT_CHARS = 160000
+ CONTEXT_CHAR_TARGET = 450000
+ DEFAULT_BASH_TIMEOUT = 300
+ MAX_BASH_TIMEOUT = 600
+@@ -129,6 +132,9 @@
+ 
+ def _mcp_is_read_only(tool) -> bool:
+     """Conservatively identify queries so only independent reads may be batched."""
++    # MCP annotations are stronger evidence than naming conventions when supplied.
++    if tool.read_only_hint is not None:
++        return tool.read_only_hint
+     # Names may be qualified as App__method. Split all separators and inspect the
+     # method's leading verb. Unknown verbs are deliberately treated as consequential.
+     method = tool.remote_name.rsplit("__", 1)[-1].lower()
+@@ -142,10 +148,12 @@
+ MCP_METHOD = """
+ Application-tool method:
+ - Start by using the application tools rather than merely announcing a plan. Follow any required conversation or workflow entry point exactly once.
+-- Read tool results as authoritative new observations. In an interactive workflow, a returned user message is a new turn to answer; do not invent the user's response or end while a material request is unresolved.
+-- Prefer narrow searches, filters, and pagination over fetching entire collections. Establish the exact record identifiers and current state before changing anything.
++- Read every result and notification as authoritative new state. In an interactive workflow, a returned user message is a new turn: reconcile it with the outstanding request, do not invent a response, and do not end while a material goal remains unresolved.
++- Before acting, extract the user's exact scope, constraints, ordering, and any required deadline. If a notification or later message changes them, revise the plan instead of completing a stale action.
++- Prefer narrow searches, filters, and pagination over fetching entire collections. Establish exact records and current state before changing anything. If a result says it was clipped, narrow or paginate rather than assuming omitted records are irrelevant.
+ - Do not call environment configuration, benchmark-control, seed, runtime, or evaluation utilities unless the user's requested task itself is to administer them.
+-- Before a consequential action, check prerequisites and scope. After it, verify the returned status before proceeding. Never batch consequential calls that depend on one another.
++- Before a consequential action, check identity, parameters, prerequisites, authorization, and whether ambiguity or confirmation remains. After it, verify the returned status before proceeding. Never batch consequential calls that depend on one another.
++- For simulated-time requests, use the authoritative clock, compute the requested boundary, and re-check state after waiting; do not substitute wall-clock time or an approximate number of polling calls.
+ """
+ 
+ 
+@@ -164,7 +172,9 @@
+     ]
+     tools = [BASH_TOOL, *mcp_schemas]
+     used_application_tool = False
++    used_bash = False
+     premature_completion_retried = False
++    completion_audit_requested = False
+     policy_retries = 0
+ 
+     for _turn in range(120):
+@@ -213,6 +223,23 @@
+                     ),
+                 })
+                 continue
++            # A separate completion pass catches requirement drift that is difficult to
++            # notice while implementing. Keep it away from interactive/application runs:
++            # an extra turn there can repeat a committed action or violate a stop protocol.
++            if not mcp_schemas and used_bash and not completion_audit_requested:
++                completion_audit_requested = True
++                messages.append({
++                    "role": "user",
++                    "content": (
++                        "Before finalizing, perform one strict completion audit against the "
++                        "original request. Compare each observable requirement with the actual "
++                        "artifact, computation, evidence, or diff as applicable; inspect for "
++                        "unintended changes, and run the strongest "
++                        "focused check still affordable. Fix only concrete gaps you find; do not "
++                        "broaden a correct solution merely to make changes. Then give the final response."
++                    ),
++                })
++                continue
+             return
+ 
+         consequential_mcp_seen = False
+@@ -230,6 +257,7 @@
+                     "decide whether this action is still appropriate and issue it separately."
+                 )
+             elif call.name == "bash":
++                used_bash = True
+                 command = str(call.arguments.get("command", ""))
+                 try:
+                     timeout_s = int(call.arguments.get("timeout_s", DEFAULT_BASH_TIMEOUT))
+@@ -259,7 +287,14 @@
+             else:
+                 output = f"unknown tool: {call.name}"
+             messages.append(
+-                {"role": "tool", "tool_call_id": call.id, "content": clip(str(output))}
++                {
++                    "role": "tool",
++                    "tool_call_id": call.id,
++                    "content": clip(
++                        str(output),
++                        MAX_MCP_RESULT_CHARS if call.name in mcp_dispatch else MAX_RESULT_CHARS,
++                    ),
++                }
+             )
+ 
+     # Avoid an unbounded pathological loop while still allowing long interactive tasks.
+--- iteration02/mcp_bridge.py
++++ iteration03/mcp_bridge.py
+@@ -20,6 +20,7 @@
+     server: "MCPServer"
+     description: str
+     schema: dict
++    read_only_hint: bool | None = None
+ 
+ 
+ class MCPServer:
+@@ -154,6 +155,14 @@
+     raise RuntimeError("could not parse MCP response: " + raw[-1000:])
+ 
+ 
++def _json_for_model(value) -> str:
++    """Keep small payloads readable without bloating large structured collections."""
++    pretty = json.dumps(value, ensure_ascii=False, indent=2)
++    if len(pretty) <= 30000:
++        return pretty
++    return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
++
++
+ def _pretty_inner(text: str) -> str:
+     try:
+         value = json.loads(text)
+@@ -164,7 +173,7 @@
+         value = value["result"]
+     if isinstance(value, str):
+         return value
+-    return json.dumps(value, ensure_ascii=False, indent=2)
++    return _json_for_model(value)
+ 
+ 
+ def friendly_result(message: dict) -> str:
+@@ -182,8 +191,8 @@
+         return prefix + "\n".join(chunks)
+     structured = result.get("structuredContent")
+     if structured is not None:
+-        return json.dumps(structured, ensure_ascii=False, indent=2)
+-    return json.dumps(result, ensure_ascii=False, indent=2)
++        return _json_for_model(structured)
++    return _json_for_model(result)
+ 
+ 
+ def declared_http_servers(instruction: str) -> list[tuple[str, str]]:
+@@ -246,8 +255,19 @@
+             if not isinstance(schema, dict):
+                 schema = {"type": "object", "properties": {}}
+             schema.setdefault("type", "object")
++            annotations = raw.get("annotations")
++            read_only_hint = None
++            if isinstance(annotations, dict) and isinstance(annotations.get("readOnlyHint"), bool):
++                read_only_hint = annotations["readOnlyHint"]
+             discovered.append(
+-                MCPTool(name, name, server, str(raw.get("description") or ""), schema)
++                MCPTool(
++                    name,
++                    name,
++                    server,
++                    str(raw.get("description") or ""),
++                    schema,
++                    read_only_hint,
++                )
+             )
+ 
+     # Preserve the advertised remote name whenever possible.  Only collisions need a

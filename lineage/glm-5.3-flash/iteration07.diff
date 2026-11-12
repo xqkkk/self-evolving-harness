@@ -1,0 +1,203 @@
+--- iteration06/harness.py
++++ iteration07/harness.py
+@@ -15,7 +15,11 @@
+ never sent, and the single soft nudge drew back an identical repeat. The
+ finish check now escalates over up to three nudges, names the environment's
+ delivery/termination tools, and tones itself by whether a delivery-style tool
+-has been called; old tool outputs are compacted before the token cap is hit.
++has been called; old tool outputs are compacted before the token cap is hit;
++(5) round 9 measured the gateway's real ceiling with images aboard (~390k
++request chars vs ~670k text-only) - image weight is now priced from true
++serialized size, compaction tightens while images are live, per-image attach
++size is budgeted, and the pace ladder fires early enough for short budgets.
+ """
+ 
+ import asyncio
+@@ -74,18 +78,32 @@
+                     " every N seconds `-vf fps=1/N,scale=800:-1 f_%03d.jpg`, scene changes"
+                     " `-vf \"select=gt(scene\\,0.3),scale=800:-1\" -vsync vfr`, or a tiled contact sheet"
+                     " `-vf fps=1/N,scale=320:-1,tile=4x5 sheet.jpg`); then view those files. Use for any"
+-                    " input you would need to look at: photos, screenshots, charts, diagrams, scoreboards."),
++                    " input you would need to look at: photos, screenshots, charts, diagrams, scoreboards."
++                    " Each round trip costs tens of seconds, so batch: issue several view_image calls in"
++                    " ONE reply to attach several images together (two or three stay visible at once),"
++                    " and survey with dense tiled contact sheets (4x5 or more frames per sheet) before"
++                    " zooming into the few frames/pages that carry the answer. If small text is"
++                    " unreadable at the downscaled size, crop the region and view that."),
+     "parameters": {"type": "object",
+                    "properties": {"path": {"type": "string", "description": "Path of the image file inside the container."},
+                                   "max_side": {"type": "integer", "description": "Downscale so the longer side is at most this many pixels (default 1024)."}},
+                    "required": ["path"]}}}
+ 
+-# Attached images are counted at a token-equivalent weight, not their base64
+-# length: vision encoders bill an image at hundreds-to-low-thousands of tokens
+-# regardless of byte size, while the base64 text is ~100-250k chars - counting
+-# it verbatim would make one picture look like half a context window.
+-IMG_CHAR_COST = 60_000
+-IMG_KEEP = 4              # newest attached images kept in history; older are pruned
++# Attached-image accounting, calibrated on round-9 trials: with base64 images
++# in the request the gateway refused at ~390-400k total request chars (while
++# text-only requests survived to ~670k) - the gateway bills image data at
++# roughly 1.7x the per-char rate of text, and 60+ refusals across 17 image
++# trials each cost a recovery round trip. So an image is priced from its real
++# serialized size, not a flat guess; a compact threshold just for image runs
++# sits well below the measured refusal line; and only a small live-image mass
++# is kept, since two or three full-size pictures alone reach the ceiling.
++IMG_CHAR_COST = 60_000        # floor per image, when the payload is tiny
++IMG_COST_FACTOR = 1.0         # images are priced at their true serialized size
++IMG_KEEP = 2                  # newest attached images kept in history
++IMG_MASS_CAP = 220_000        # max total serialized size of live images
++IMG_COMPACT_AT_CHARS = 330_000  # compaction threshold while images are live
++IMG_ACCEPT_BYTES = 78_000     # per-image attach budget in _IMAGE_SNIPPET (two of
++                             # these fit inside IMG_MASS_CAP, so batched views stay live)
+ 
+ _IMAGE_SNIPPET = r'''
+ import base64, io, sys
+@@ -101,14 +119,14 @@
+     s = max(w, h)
+     if s > ms:
+         im = im.resize((max(1, w * ms // s), max(1, h * ms // s)))
+-    for side in (ms, min(ms, 640)):
++    for side, q in ((ms, 72), (min(ms, 768), 62), (560, 50)):
+         w2, h2 = im.size
+         s2 = max(w2, h2)
+         im2 = im.resize((max(1, w2 * side // s2), max(1, h2 * side // s2))) if s2 > side else im
+         b = io.BytesIO()
+-        im2.save(b, "JPEG", quality=80 if side == ms else 55)
++        im2.save(b, "JPEG", quality=q)
+         data, fmt = b.getvalue(), "jpeg"
+-        if len(b.getvalue()) <= 700000:
++        if len(b.getvalue()) <= 78000:
+             break
+ except Exception:
+     pass
+@@ -145,10 +163,19 @@
+     m["content"][j] = {"type": "text", "text": note}
+ 
+ 
+-def _prune_images(messages, keep=IMG_KEEP):
++def _prune_images(messages, keep=IMG_KEEP, cap=IMG_MASS_CAP):
++    """Keep the newest attached images up to ``keep`` of them and a total
++    serialized mass of ``cap`` chars - measured live sizes, since a couple of
++    full-size pictures alone reach the gateway's refusal line (round-9
++    trials). Pruned in place, never deleted, so replay pairing stays intact."""
++    mass = 0
+     parts = list(_image_parts(messages))
+-    for m, j in parts[:-keep] if keep else parts:
+-        _replace_image_part(m, j, "[earlier image removed to save context]")
++    for n, (m, j) in enumerate(reversed(parts)):
++        size = len(m["content"][j].get("image_url", {}).get("url", ""))
++        if n >= keep or mass + size > cap:
++            _replace_image_part(m, j, "[earlier image removed to save context]")
++        else:
++            mass += size
+ 
+ 
+ def _strip_all_images(messages):
+@@ -186,7 +213,8 @@
+     except ValueError:
+         return "view_image error: bad encoder output"
+     if not fmt or len(b64) > 1_600_000:
+-        return "view_image error: image too large to attach; extract a smaller frame (scale=640:-1) and view that."
++        return ("view_image error: image too large to attach even after downscaling; extract a"
++                " smaller region (crop the part that matters, or scale=640:-1) and view that.")
+     return {"format": fmt, "b64": b64, "path": path}
+ 
+ SYSTEM_PROMPT = """You are an autonomous agent completing a task in a Linux container. Work through tool calls
+@@ -194,7 +222,7 @@
+ 
+ Working method:
+ 1. Pin down the deliverable before acting: exactly what artifact, answer, or effect is required (file paths, formats, names, recipients), and any constraints or acceptance criteria the task states.
+-2. Inventory before you build: look at the working directory, the inputs, and what is already installed (interpreters, packages, CLI tools); prefer what exists over downloading or rebuilding; sample data formats before parsing. If inputs include images, video, or PDFs, inspect them early - extract frames/pages (ffmpeg, pdftoppm) and use the view_image tool to actually look at them, rather than inferring from names, metadata, or pixel arithmetic.
++2. Inventory before you build: look at the working directory, the inputs, and what is already installed (interpreters, packages, CLI tools); prefer what exists over downloading or rebuilding; sample data formats before parsing. If inputs include images, video, or PDFs, inspect them early - extract frames/pages (ffmpeg, pdftoppm) and use the view_image tool to actually look at them, rather than inferring from names, metadata, or pixel arithmetic. Treat seeing as a pipeline: survey cheaply (tiled sheets, several view_image calls batched into one reply), then zoom into the few frames/pages/regions that carry the answer; never answer a picture question you have not actually looked at. Mix methods: text-extract what is text, render and view the pages, figures, tables, or scans that carry the answer.
+ 3. Work in small verified steps: run a command, read the result, adjust. When something fails, read the actual error and change something - do not repeat the same call expecting a different result.
+ 4. Be economical with output: search and slice (grep -n, sed -n, head, tail) instead of dumping whole files; batch related commands into one call.
+ 
+@@ -205,7 +233,7 @@
+    use, kill) or detach it (`setsid nohup CMD >log 2>&1 </dev/null &`) and
+    poll the log or port in later calls; wrap anything that could block in
+    `timeout Ns` so a hang costs seconds, never the run.
+-5. Checkpoint the deliverable: as soon as a required artifact exists in acceptable form, write it to the requested location; refine afterwards if time allows. Never leave a task without its deliverable in place. The deliverable may be a file, a sent message, or your final reply - find out which and bank a defensible version of it early, then improve it. If part of the task cannot be done here (a tool, file, or network resource is missing), do not burn the budget trying to obtain it: deliver the best answer the environment allows and say plainly what is missing.
++5. Checkpoint the deliverable: as soon as a required artifact exists in acceptable form, write it to the requested location; refine afterwards if time allows. Never leave a task without its deliverable in place. The deliverable may be a file, a sent message, or your final reply - find out which and bank a defensible version of it early, then improve it. If part of the task cannot be done here (a tool, file, or network resource is missing), do not burn the budget trying to obtain it: deliver the best answer the environment allows and say plainly what is missing. If the deliverable is your final message, do not hold it for a perfect ending: as soon as it is defensible, end the run with it - every further round trip risks the run being cut before anything is delivered.
+ 6. Verify before finishing: re-read the task's requirements and check each against what you actually produced (exact path, exact format, the value actually asked for); if a checker or test suite exists, run it. When the deliverable is a specific value, re-derive it once by an independent method before answering: carry full precision through intermediate steps, watch units and rounding conventions, and round only at the final step, exactly as the task asks.
+ 7. When the task asks a question, make your final message state the exact answer plainly - the precise value, name, or phrase requested - not just reasoning around it.
+ 8. Deliver through the environment's own channels: if the task provides tools for sending messages, submitting, saving, or terminating (or names a required file or channel), perform those acts with those tools; a plain-text reply reaches no one and simply ends the run. If a requirement is genuinely ambiguous and you can ask the user a question, ask one concise question early; otherwise proceed on the most conservative reading and state your assumption. If the task describes an interactive protocol (a person or service that replies, a limited number of exchanges), the interaction itself is part of the work: use the channel as the task spells out instead of answering from assumptions. Before finishing, check whether the instructions define an ending protocol (a stop token, or an end/terminate/submit call) and perform it.
+@@ -267,13 +295,16 @@
+ # budget is unknown (and varies per task), so these never claim a limit; they
+ # just keep the model converging and its deliverable valid on disk.
+ PACE_STEPS = (
+-    (6, "Checkpoint: the deliverable must exist in its required location right now - if it does"
++    (4, "Checkpoint: the deliverable must exist in its required location right now - if it does"
+         " not exist yet, write a provisional version now (marked provisional) and refine it later."),
+-    (12, "Shift weight from exploring to finishing; keep the deliverable valid on disk from here on."),
+-    (18, "Prefer completing and verifying exactly what was asked over broadening the work."),
+-    (26, "A lot of time has gone by: finish the remaining essentials, verify the deliverable in its"
+-         " final place, and end the run cleanly."),
+-    (40, "Wrap up now: finalize, verify, and finish rather than start anything new."),
++    (8, "Converge: stop broad exploration. If the deliverable is already defensible, finish and"
++        " end the run with it; if it genuinely needs more work, keep it valid in its final place"
++        " from here on."),
++    (14, "Prefer completing and verifying exactly what was asked over broadening the work."),
++    (20, "Finish the remaining essentials, verify the deliverable in its final place, and end the"
++         " run cleanly."),
++    (32, "Wrap up now: finalize, verify, and finish rather than start anything new. If the"
++         " deliverable is a final message, give your best current answer and end the run."),
+ )
+ 
+ 
+@@ -576,7 +607,8 @@
+             total += len(json.dumps({k: v for k, v in m.items() if k != "content"}, default=str))
+             for part in c:
+                 if isinstance(part, dict) and part.get("type") == "image_url":
+-                    total += IMG_CHAR_COST
++                    total += max(IMG_CHAR_COST,
++                                 IMG_COST_FACTOR * len(json.dumps(part, default=str)))
+                 else:
+                     total += len(json.dumps(part, default=str))
+         else:
+@@ -584,10 +616,26 @@
+     return total
+ 
+ 
++def _live_image_count(messages):
++    return sum(1 for _ in _image_parts(messages))
++
++
++def _image_mass(messages):
++    """Accounted weight of the live images (same pricing as _history_chars)."""
++    return sum(max(IMG_CHAR_COST, IMG_COST_FACTOR * len(m["content"][j].get("image_url", {}).get("url", "")))
++               for m, j in _image_parts(messages))
++
++
+ def _maybe_compact(messages):
+     """Proactively trim old tool outputs as history grows, so the request stays
+-    far below the gateway's input-token cap on long runs."""
+-    if _history_chars(messages) > COMPACT_AT_CHARS:
++    far below the gateway's input-token cap on long runs. While images are
++    live the threshold drops to the measured refusal band (round-9: with
++    base64 aboard, refusals began at ~390k request chars), and image pruning
++    runs with every compaction so old pictures cannot keep the request over
++    the line."""
++    threshold = IMG_COMPACT_AT_CHARS if _live_image_count(messages) else COMPACT_AT_CHARS
++    if _history_chars(messages) > threshold:
++        _prune_images(messages)
+         _shrink_history(messages, keep_last=10)
+ 
+ 
+@@ -697,6 +745,7 @@
+                     _rebuild_history(messages, REBUILD_NOTE)
+                 else:
+                     _shrink_history(messages)
++                _prune_images(messages)
+                 continue
+             if list(_image_parts(messages)) and any(
+                     s in text for s in ("image", "media", "multimodal", "content part", "data url",
+@@ -838,7 +887,7 @@
+                         " previous ones. If you are polling for a change, poll differently (or"
+                         " wait first); otherwise stop repeating: change something in how you"
+                         " attack this, or finish the task.")
+-            pressure = (_history_chars(messages) + len(out)) / COMPACT_AT_CHARS
++            pressure = (_history_chars(messages) - _image_mass(messages) + len(out)) / COMPACT_AT_CHARS
+             if "ctx80" not in pace and pressure >= 0.8:
+                 pace["ctx80"] = True
+                 out += CTX_PRESSURE_80

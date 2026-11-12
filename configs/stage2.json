@@ -1,0 +1,26 @@
+{
+  "description": "Second stage (continual training on Claw-Eval with success anchors), as run in the paper for GPT-5.6 Sol and GLM-5.3-Flash.",
+  "iterations": [6, 7],
+  "budgets": [200, 100],
+  "update_timeout_sec": 7200,
+  "update_attempts": 3,
+  "max_input_tokens": 258400,
+  "new_domain": {
+    "name": "claw",
+    "dataset": "datasets/claw-eval",
+    "host_judge": "judges.claw_eval",
+    "round_tasks": ["configs/splits/stage2-claw-iteration06.txt", "configs/splits/stage2-claw-iteration07.txt"]
+  },
+  "anchors": {
+    "per_benchmark_per_round": 4,
+    "seed": 1,
+    "stage1_iterations": 5,
+    "benchmarks": [
+      {"name": "tb21", "dataset": "terminal-bench/terminal-bench-2-1"},
+      {"name": "gaia2", "dataset": "datasets/gaia2-cli", "host_judge": "judges.gaia2"},
+      {"name": "officeqa", "dataset": "datasets/officeqa-pro", "env_kwargs": {"snapshot_template_name": "officeqa-pro-corpus"}},
+      {"name": "tau3", "dataset": "datasets/tau3-bench"},
+      {"name": "sbp", "dataset": "datasets/swe-bench-pro-nogit"}
+    ]
+  }
+}

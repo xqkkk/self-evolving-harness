@@ -1,0 +1,117 @@
+--- iteration06/harness.py
++++ iteration07/harness.py
+@@ -87,6 +87,16 @@
+                 and any(word in context for word in ("stop", "terminate", "end the conversation"))):
+             return True
+         start = pos + 1
++
++
++def _ends_turn_tool(item):
++    """Honor tool metadata that declares a successful call ends this agent turn."""
++    text = item.get("description", "").lower()
++    matches = re.finditer(
++        r"\b(?:will\s+)?(?:end|ends|finish|finishes|terminate|terminates)\s+"
++        r"(?:the\s+)?(?:agent(?:['’]s)?\s+)?turn\b", text
++    )
++    return any("not" not in text[max(0, m.start() - 16):m.start()].split() for m in matches)
+ 
+ 
+ def _terminal_tool(name):
+@@ -174,7 +184,7 @@
+                     name = f"{prefix}__{actual_name}"
+                 if name in routes or name in ("bash", "view_image"):
+                     continue
+-                routes[name] = (url, sid, actual_name)
++                routes[name] = (url, sid, actual_name, _ends_turn_tool(item))
+                 schema = _tool_schema(item)
+                 schema["function"]["name"] = name
+                 tools.append(schema)
+@@ -229,18 +239,37 @@
+     policy_retries = 0
+     visual_inspections = 0
+     visual_budget_noted = False
++    visual_exhausted_at = None
++    delivery_noted = False
++    run_started = time.monotonic()
+     review_started = None
+     review_calls = 0
+     review_deadline_noted = False
+     while True:
+         messages = _shrink_history(messages)
+         active_tools = tools
++        forced_finish = False
+         if visual_inspections >= 24:
+             active_tools = [t for t in tools if t["function"]["name"] != "view_image"]
++            if visual_exhausted_at is None:
++                visual_exhausted_at = model_calls
+             if not visual_budget_noted:
+                 messages.append({"role": "system", "content":
+                     "The visual inspection budget is exhausted. Synthesize the evidence already gathered, produce and validate every requested artifact now, and finish; do not generate more review frames."})
+                 visual_budget_noted = True
++        elapsed = time.monotonic() - run_started
++        if visual_inspections >= 12 and elapsed > 360 and not delivery_noted:
++            messages.append({"role": "system", "content":
++                "Delivery reserve: stop broad evidence gathering. Build the requested artifact or answer from the strongest evidence now, then run only decisive validation."})
++            delivery_noted = True
++        if ((visual_inspections >= 12 and elapsed > 500) or
++                (visual_exhausted_at is not None and model_calls - visual_exhausted_at >= 8)):
++            active_tools = []
++            forced_finish = True
++            if not review_deadline_noted:
++                messages.append({"role": "system", "content":
++                    "The visual work window is over. Report the best validated deliverable already present now; do not request more tools or start a fresh review."})
++                review_deadline_noted = True
+         if review_started is not None and (
+             time.monotonic() - review_started > 150 or review_calls >= 8
+         ):
+@@ -292,7 +321,7 @@
+         if not reply.tool_calls:
+             # Once the environment has been explicitly closed, an extra audit can
+             # only waste a turn or violate a prescribed stop protocol.
+-            if routes and (terminal_action or _declared_terminal_reply(reply.text, instruction)):
++            if forced_finish or (routes and (terminal_action or _declared_terminal_reply(reply.text, instruction))):
+                 return
+             if completion_audits == 0:
+                 completion_audits += 1
+@@ -313,6 +342,11 @@
+                     ]
+                 continue
+             return
++        if forced_finish:
++            for call in reply.tool_calls:
++                messages.append({"role": "tool", "tool_call_id": call.id,
++                                 "content": "Tool unavailable: finish with the validated result already obtained."})
++            continue
+         extra_images = []
+         turn_visuals = 0
+         for call in reply.tool_calls:
+@@ -324,6 +358,8 @@
+                     if review_started is not None:
+                         remaining = max(1, int(150 - (time.monotonic() - review_started)))
+                         timeout = min(timeout, remaining)
++                    if visual_inspections >= 12:
++                        timeout = min(timeout, max(1, int(500 - (time.monotonic() - run_started))))
+                     r = await world.exec(command, timeout_s=timeout)
+                     parts = [r.stdout]
+                     if r.stderr:
+@@ -341,9 +377,9 @@
+                             turn_visuals += 1
+                             visual_inspections += 1
+                 elif call.name in routes:
+-                    url, sid, actual_name = routes[call.name]
++                    url, sid, actual_name, ends_turn = routes[call.name]
+                     output = _clip(await mcp_bridge.call(world, url, sid, actual_name, call.arguments))
+-                    if _terminal_tool(actual_name) and not output.startswith(("MCP error:", "MCP transport error:", "MCP tool reported an error:")):
++                    if (ends_turn or _terminal_tool(actual_name)) and not output.startswith(("MCP error:", "MCP transport error:", "MCP tool reported an error:")):
+                         terminal_action = True
+                 else:
+                     output = f"Unknown tool: {call.name}"
+@@ -352,6 +388,8 @@
+             messages.append({"role": "tool", "tool_call_id": call.id, "content": output})
+             if extra_image:
+                 extra_images.append(extra_image)
++            if terminal_action:
++                return
+         if not routes and model_calls in (24, 48):
+             messages.append({"role": "system", "content":
+                 "Milestone checkpoint: reconcile the original acceptance contract against current artifacts and `/tmp/agent_progress.md` before broadening the search. Record unresolved rows, prioritize the highest-risk observable gap, and reserve time to validate and leave a complete deliverable."})

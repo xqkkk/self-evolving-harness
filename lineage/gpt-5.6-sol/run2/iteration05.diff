@@ -1,0 +1,78 @@
+--- iteration04/harness.py
++++ iteration05/harness.py
+@@ -2,6 +2,7 @@
+ 
+ import asyncio
+ import json
++import shlex
+ 
+ from .mcp_bridge import MCPBridge
+ 
+@@ -15,7 +16,7 @@
+ 3. Validate independently before finishing. Check required artifacts exist and match the requested format. For code, turn every stated requirement into a checklist of observable behavior and exact public contracts (names, signatures, defaults, ordering, error behavior), inspect all production call sites, and preserve compatibility only where it does not weaken the requested contract. Fix the root cause rather than a one-off example, consider boundary/error cases, run focused tests and then the broadest practical checks, and review the final diff. A newly failing existing test is evidence of a compatibility bug: fix it rather than excluding it or declaring it obsolete. Do not weaken tests or unrelated behavior.
+ 4. For document/data questions, distinguish exact definitions, populations, period/date, units, signs, totals versus components, and percent versus decimal. Inspect table titles, headings, row/column alignment and footnotes; when revisions matter, find the latest source that reports the requested period and verify that later sources did not revise it. A question about a page, chart, or visual layout requires visual evidence: page boundaries in extracted text are not a substitute, so locate/render the source page or its image when available and explicitly define any visual counting rule (including ties and endpoints). State the observations and formula, calculate with a script, and re-read the source context as an independent check. Do not silently substitute a similar metric.
+ 5. For interactive scenarios, treat the requested action and its stopping point literally; do not extend a preparatory or informational request into a downstream committing operation. Capture the initial state when relevant, inspect every notification and tool error, honor temporal cutoffs, and verify final state after consequential actions. Re-evaluate the full request when new messages arrive; do not guess a materially ambiguous target or execute multiple possible interpretations. Ask one concise clarification before the blocked action, then stop unless the protocol explicitly supplies a way to await the answer. Calls in one assistant turn are conceptually unordered, so batch only independent operations—put reads and dependent or ordered mutations in separate turns. Keep a timeline for deadline-based workflows: anchor it to the event the user named, process arrivals in order, act at the earliest required event, and never replace “exactly” or “immediately” with an arbitrary polling delay. After a timeout or transport failure, inspect state before replaying any call that may already have committed. Treat user-facing sends as consequential actions: send only requested checkpoints, clarifications, and final answers, never progress chatter. Do not announce completion before waits or follow-up events are resolved. If the protocol requires an initial tool call, make it before conversational text; a readiness statement is not completion.
+-6. Manage the task's time as a resource. Sample or benchmark potentially expensive work before scaling it, prefer batching or parallelism over long serial loops, set realistic command timeouts, and preserve enough time for validation and the required artifact. If one approach is too slow or repeatedly fails, diagnose once and switch strategies rather than retrying blindly.
++6. Manage the task's time as a resource. Sample or benchmark potentially expensive work before scaling it, prefer batching or parallelism over long serial loops, set realistic command timeouts, and preserve enough time for validation and the required artifact. If one approach is too slow or repeatedly fails, diagnose once and switch strategies rather than retrying blindly. Keep package-manager, network, and service-start attempts bounded well below the task budget. When starting a persistent process, fully detach its process group and standard streams (for example with a daemon mode or setsid), and verify readiness in a later command.
+ 
+ Tool output shown to you may be abbreviated when it is very large; the full command still ran. If that happens, rerun a targeted query or save and inspect the relevant slice. Preserve user work. Keep going until the result is verified, then give a concise final response and make no further tool calls."""
+ 
+@@ -51,6 +52,32 @@
+ 
+ def _message_size(messages):
+     return sum(len(json.dumps(m, ensure_ascii=False)) for m in messages)
++
++
++def _forget_large_bash_payload(message, limit=4000):
++    """Keep generated scripts on disk, not repeated in every model request."""
++    def shorten(arguments):
++        try:
++            value = json.loads(arguments)
++        except (TypeError, json.JSONDecodeError):
++            return arguments
++        command = value.get("command")
++        if isinstance(command, str) and len(command) > limit:
++            value["command"] = (
++                f"[executed {len(command):,}-character shell payload; inspect the "
++                "created files and tool output if its contents are needed]"
++            )
++            return json.dumps(value)
++        return arguments
++
++    for call in message.get("tool_calls") or []:
++        fn = call.get("function") or {}
++        if fn.get("name") == "bash":
++            fn["arguments"] = shorten(fn.get("arguments"))
++    # Responses API clients replay these raw items instead of tool_calls.
++    for item in message.get("_responses_items") or []:
++        if item.get("type") == "function_call" and item.get("name") == "bash":
++            item["arguments"] = shorten(item.get("arguments"))
+ 
+ 
+ def _compact(messages, emergency=False):
+@@ -90,6 +117,17 @@
+             command = str(call.arguments.get("command", ""))
+             timeout = call.arguments.get("timeout_s")
+             try:
++                # Some remote exec backends do not reliably enforce their own
++                # deadline. Coreutils supplies an independent in-container one.
++                if timeout is not None:
++                    seconds = max(1, min(3600, int(timeout)))
++                    inner = shlex.quote(command)
++                    command = (
++                        "if command -v timeout >/dev/null 2>&1; then "
++                        f"timeout --signal=TERM --kill-after=5s "
++                        f"{seconds}s sh -lc {inner}; else sh -lc {inner}; fi"
++                    )
++                    timeout = seconds + 10
+                 r = await world.exec(command, timeout_s=timeout)
+                 parts = [r.stdout]
+                 if r.stderr:
+@@ -138,6 +176,7 @@
+             outputs = [await execute(call) for call in reply.tool_calls]
+         else:
+             outputs = await asyncio.gather(*(execute(call) for call in reply.tool_calls))
++        _forget_large_bash_payload(reply.message)
+         for call, output in zip(reply.tool_calls, outputs):
+             messages.append({
+                 "role":"tool", "tool_call_id":call.id,

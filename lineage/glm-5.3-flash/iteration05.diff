@@ -1,0 +1,334 @@
+--- iteration04/harness.py
++++ iteration05/harness.py
+@@ -35,8 +35,13 @@
+ TOOL_HEAD = 26000
+ TOOL_TAIL = 10000
+ MCP_NOTE_HEADER = "MCP servers reachable from inside the task container:"
+-EXEC_TIMEOUT_S = 1800.0          # one command must not be able to eat the run
+-COMPACT_AT_CHARS = 480_000       # ~140k tokens; leave headroom under the 258k cap
++EXEC_TIMEOUT_S = 420.0           # one foreground exec early in the run; the cap
++EXEC_FLOOR_S = 150.0             # shrinks to this floor as the run ages so a hung
++EXEC_SHRINK_PER_MIN = 15.0       # command always returns control with time to
++                                 # recover and deliver before the unknown wall
++COMPACT_AT_CHARS = 430_000       # ~110-140k tokens of true request weight; past
++                                 # ~670k chars (incl. replayed reasoning) requests
++                                 # have been refused by the gateway
+ WATCHDOG_S = 990.0               # per model call: a successful generation can need at most
+                                  # 3 gateway samples (~300 s each); past this it is dead and
+                                  # only the run's own timeout would notice
+@@ -54,8 +59,10 @@
+ BASH_TOOL = {"type": "function", "function": {
+     "name": "bash",
+     "description": ("Run a bash command in the task container and return its output."
+-                    " A command is killed after 30 minutes; run long jobs in the"
+-                    " background (nohup ... >log 2>&1 &) and poll the log instead."),
++                    " stdin is closed, and the exec is killed after a few minutes"
++                    " (tighter late in the run). A backgrounded child keeps the exec"
++                    " open: detach long or blocking jobs (`setsid nohup CMD >log 2>&1"
++                    " </dev/null &`) and poll the log in later calls."),
+     "parameters": {"type": "object",
+                    "properties": {"command": {"type": "string", "description": "The command to run."}},
+                    "required": ["command"]}}}
+@@ -68,6 +75,14 @@
+ 2. Inventory before you build: look at the working directory, the inputs, and what is already installed (interpreters, packages, CLI tools); prefer what exists over downloading or rebuilding; sample data formats before parsing.
+ 3. Work in small verified steps: run a command, read the result, adjust. When something fails, read the actual error and change something - do not repeat the same call expecting a different result.
+ 4. Be economical with output: search and slice (grep -n, sed -n, head, tail) instead of dumping whole files; batch related commands into one call.
++
++   Bash exec semantics that bite: stdin arrives closed (a command that waits
++   for input gets EOF and exits rather than hanging), and an exec does not
++   return until every process it started exits - so a backgrounded server
++   holds the exec open. Either keep such a job inside one bounded exec (start,
++   use, kill) or detach it (`setsid nohup CMD >log 2>&1 </dev/null &`) and
++   poll the log or port in later calls; wrap anything that could block in
++   `timeout Ns` so a hang costs seconds, never the run.
+ 5. Checkpoint the deliverable: as soon as a required artifact exists in acceptable form, write it to the requested location; refine afterwards if time allows. Never leave a task without its deliverable in place.
+ 6. Verify before finishing: re-read the task's requirements and check each against what you actually produced (exact path, exact format, the value actually asked for); if a checker or test suite exists, run it. When the deliverable is a specific value, re-derive it once by an independent method before answering: carry full precision through intermediate steps, watch units and rounding conventions, and round only at the final step, exactly as the task asks.
+ 7. When the task asks a question, make your final message state the exact answer plainly - the precise value, name, or phrase requested - not just reasoning around it.
+@@ -115,6 +130,15 @@
+ 
+ def time_tag(t0):
+     return "[elapsed %.1f min]" % ((time.monotonic() - t0) / 60.0)
++
++
++def exec_cap(t0):
++    """Cap for one exec: generous while the run is young (installs, builds),
++    shrinking to EXEC_FLOOR_S as it ages. No flat cap is safe against a hung
++    command: the run's total budget is unknown, so late in a run only a small
++    cap still leaves time to recover and deliver."""
++    return max(EXEC_FLOOR_S, EXEC_TIMEOUT_S
++               - EXEC_SHRINK_PER_MIN * ((time.monotonic() - t0) / 60.0))
+ 
+ 
+ # Escalating, advisory pace notes appended to tool results as a run ages. The
+@@ -244,8 +268,10 @@
+ async def _list_tools(world, server):
+     last = "no attempt"
+     for _ in range(2):
+-        r = await world.exec("%s %s/bridge.py list %s" % (PY_CMD, MCP_DIR, _target_args(server)),
+-                             timeout_s=MCP_LIST_TIMEOUT_S + 30)
++        r = await asyncio.wait_for(
++            world.exec("%s %s/bridge.py list %s" % (PY_CMD, MCP_DIR, _target_args(server)),
++                       timeout_s=MCP_LIST_TIMEOUT_S + 30),
++            timeout=MCP_LIST_TIMEOUT_S + 30)
+         env = _last_json(r.stdout)
+         if env and env.get("ok"):
+             return env.get("tools") or []
+@@ -261,7 +287,7 @@
+     install = ("mkdir -p %(dir)s && cat > %(dir)s/bridge.py <<'%(delim)s'\n%(src)s\n%(delim)s\n"
+                "PY=$(command -v python3 || command -v python); echo \"PY=$PY\""
+                % {"dir": MCP_DIR, "delim": BRIDGE_DELIM, "src": BRIDGE_SOURCE})
+-    r = await world.exec(install, timeout_s=120)
++    r = await asyncio.wait_for(world.exec(install, timeout_s=120), timeout=120)
+     if r.return_code != 0 or "PY=" not in (r.stdout or ""):
+         return [], ["bridge install failed (rc=%s): %s"
+                     % (r.return_code, (r.stderr or r.stdout or "")[-300:])]
+@@ -285,7 +311,12 @@
+         PY_CMD, MCP_DIR, _target_args(tool["server"]), shlex.quote(tool["mcp_name"]),
+         shlex.quote(json.dumps(args or {})), MCP_CALL_TIMEOUT_S)
+     try:
+-        r = await world.exec(cmd, timeout_s=MCP_CALL_TIMEOUT_S + 90)
++        # Same harness-side bound as exec_bash: the bridge has its own internal
++        # timeout for the tool call, so this only has to catch a wedged
++        # transport - but it must not hang the run past the unknown wall either.
++        r = await asyncio.wait_for(
++            world.exec(cmd, timeout_s=MCP_CALL_TIMEOUT_S + 90),
++            timeout=MCP_CALL_TIMEOUT_S + 90)
+     except Exception as exc:
+         return "MCP transport error: %s: %s" % (type(exc).__name__, exc)
+     env = _last_json(r.stdout)
+@@ -306,16 +337,29 @@
+     return ("The tool reported an error:\n" if env.get("isError") else "") + out
+ 
+ 
+-async def exec_bash(world, args):
++async def exec_bash(world, args, t0, state):
+     command = args.get("command") if isinstance(args, dict) else None
+     if not isinstance(command, str) or not command.strip():
+         return "bash error: no command given"
++    limit = exec_cap(t0)
+     try:
+-        r = await world.exec(command, timeout_s=EXEC_TIMEOUT_S)
++        # stdin is closed up front so a stdin-reader gets EOF instead of hanging,
++        # and wait_for enforces the cap harness-side: some transports ignore
++        # their own timeout_s, and only control returning here turns a hung
++        # command into a recoverable error instead of a wall-clock death.
++        r = await asyncio.wait_for(
++            world.exec("exec 0</dev/null; " + command, timeout_s=limit),
++            timeout=limit)
++    except asyncio.TimeoutError:
++        state["exec_hung"] = True
++        return ("bash error: killed after %ds (the cap tightens as the run ages);"
++                " run it detached instead: `setsid nohup ... >log 2>&1 </dev/null &`,"
++                " then poll the log - or wrap the command in `timeout Ns`, or narrow"
++                " it" % limit)
+     except Exception as exc:
+-        return ("bash error: %s: %s (the command was killed after %ds; rerun it in the"
+-                " background with `nohup ... >log 2>&1 &`, poll the log, or narrow the"
+-                " command)" % (type(exc).__name__, exc, EXEC_TIMEOUT_S))
++        return ("bash error: %s: %s (the command was killed after %.0fs; rerun it in"
++                " the background with `setsid nohup ... >log 2>&1 </dev/null &`, poll"
++                " the log, or narrow the command)" % (type(exc).__name__, exc, limit))
+     parts = [r.stdout]
+     if r.stderr:
+         parts.append("[stderr]\n" + r.stderr)
+@@ -329,23 +373,56 @@
+             or "too long" in text or "input tokens" in text)
+ 
+ 
++def _trim_arguments(a, keep=800):
++    """Shorten an old tool-call's argument string to a valid-JSON prefix, so a
++    gateway that parses arguments still accepts the replayed item."""
++    cut = a[:keep]
++    p = cut.rfind("}")
++    if p > 0:
++        try:
++            json.loads(cut[:p + 1])
++            return cut[:p + 1]
++        except Exception:
++            pass
++    return "{\"trimmed\": true}"
++
++
+ def _shrink_history(messages, keep_last=6, floor=300):
+-    """Trim old tool outputs in place (never delete messages: the replay chain
+-    pairs every tool result with its call). Used to recover from context
+-    overflow and to shrink a request before retrying after a cut-off."""
+-    n_tool = 0
+-    for i in range(len(messages) - 1, -1, -1):
+-        if messages[i].get("role") == "tool":
+-            n_tool += 1
+-            if n_tool > keep_last:
+-                c = messages[i].get("content")
+-                if isinstance(c, str) and len(c) > floor + 100:
+-                    messages[i]["content"] = c[:floor] + "...[older output trimmed]"
++    """Trim the heavy, stale parts of old history in place (never delete
++    messages: the replay chain pairs every tool result with its call). The
++    last ``keep_last`` messages stay verbatim; older ones lose long tool
++    outputs, old tool-call arguments (whole files written inline) and the
++    replayed per-turn reasoning blobs — the true bulk of a long reasoning-
++    heavy request, which trimming tool outputs alone never touched."""
++    for m in messages[:-keep_last] if keep_last else messages:
++        role = m.get("role")
++        if role == "tool":
++            c = m.get("content")
++            if isinstance(c, str) and len(c) > floor + 100:
++                m["content"] = c[:floor] + "...[older output trimmed]"
++        elif role == "assistant":
++            _drop_replay(m)
++            for tc in m.get("tool_calls") or []:
++                a = (tc.get("function") or {}).get("arguments")
++                if isinstance(a, str) and len(a) > 1000:
++                    tc["function"]["arguments"] = _trim_arguments(a)
++
++
++def _drop_replay(m):
++    """Remove the per-turn reasoning replay fields an assistant message may
++    carry. They exist only to help the model continue its own train of thought
++    across a tool call; old turns' reasoning is dead weight in every later
++    request, and on reasoning-heavy runs it is most of the request."""
++    for k in ("_responses_items", "reasoning", "reasoning_details"):
++        m.pop(k, None)
+ 
+ 
+ def _history_chars(messages):
+-    return sum(len(m.get("content") or "") for m in messages
+-               if isinstance(m.get("content"), str))
++    """Estimate what a request really weighs: every serialized message field,
++    not just ``content``. Tool-call arguments (whole files written inline) and
++    the replayed reasoning blobs are invisible to a content-only count yet
++    they are what filled the context window in the trials that died."""
++    return sum(len(json.dumps(m, default=str)) for m in messages)
+ 
+ 
+ def _maybe_compact(messages):
+@@ -370,6 +447,14 @@
+     " or, if the task is done, one short sentence - and no prose.",
+ )
+ 
++REBUILD_NOTE = (
++    "[harness] The request exceeded the model's context window even after"
++    " trimming, so older turns were dropped and replayed reasoning cleared."
++    " The task instruction is at the top; the recent history shows where you"
++    " are. Continue from the current state without redoing finished work, and"
++    " keep replies small.")
++
++
+ # Once generations start being cut off (or succeeding only after ~15 min of
+ # sampling), that property holds for the rest of the run - so unlike the one-shot
+ # retry notes above, the adaptation is persistent: it rides on every tool result
+@@ -379,6 +464,33 @@
+               " so one oversized reply can cost ~15 min even when it eventually gets through)."
+               " From here on keep every reply to one small tool call; do nontrivial computation"
+               " by writing a short script and running it, never by working it out in your reply.")
++
++
++# Same rule for execs as the stall note for generations: one hang marks the
++# run, and later tool results keep carrying the fix so it survives compaction.
++HANG_NOTE = (" [harness hang-watch] A foreground command was just killed for running too"
++             " long. From here on start anything that could block or run for minutes in"
++             " the background detached (`setsid nohup CMD >log 2>&1 </dev/null &`) and"
++             " poll the log; keep foreground commands to quick, bounded steps.")
++
++
++def _rebuild_history(messages, note):
++    """Last-resort recovery from a context error that survives shrinking: keep
++    the system prompt, the original instruction, and a clean tail of recent
++    turns (starting at a non-tool message, so no tool result is orphaned from
++    its call), with all replayed reasoning dropped. Rewrites the list in
++    place; the recorder sees a rewritten history and logs it in full."""
++    tail = list(messages[-12:])
++    while len(tail) > 1 and tail[0].get("role") != "assistant":
++        tail.pop(0)
++    for m in tail:
++        _drop_replay(m)
++    messages[:] = [messages[0], messages[1], {"role": "user", "content": note}] + tail
++    _shrink_history(messages, keep_last=2)
++
++
++CTX_PRESSURE_50 = (" [harness context] The conversation is filling up: as it grows, older tool outputs and old per-turn reasoning are trimmed automatically. Persist anything you may need later (key values, paths, decisions, what has been ruled out) into a notes file in the container and re-read it if context is cut back; query narrowly (grep, head, tail) instead of dumping files into the transcript.")
++CTX_PRESSURE_80 = (" [harness context] The request is nearing the compaction threshold: keep replies small, write large content to files in chunks, and move toward finalizing and verifying the deliverable.")
+ 
+ 
+ async def call_model(model, messages, tools, state):
+@@ -395,7 +507,6 @@
+     """
+     attempt = 0
+     cutoffs = 0
+-    injected = []
+     while True:
+         try:
+             started = time.monotonic()
+@@ -408,23 +519,31 @@
+                 # Succeeded, but only after ~2 wasted gateway samples: the run
+                 # will keep paying that price unless the replies get smaller.
+                 state["stalled"] = True
+-            for i in reversed(injected):
+-                del messages[i]  # the note did its job; do not shape later turns
++            # One-shot notes are dropped once a reply gets through (matched by
++            # their exact harness-written text, not by index: a rebuild may
++            # have rewritten the list in between; no foreign key is added to
++            # any message, so the request stays within what the client sends).
++            messages[:] = [m for m in messages if m.get("content") not in CUTOFF_NOTES]
+             return reply
+         except asyncio.CancelledError:
+             raise
+         except Exception as exc:
+             text = ("%s: %s" % (type(exc).__name__, exc)).lower()
+-            if _is_context_error(text) and attempt <= 3:
++            if _is_context_error(text) and attempt <= 4:
+                 attempt += 1
+-                _shrink_history(messages)
++                if attempt >= 3:
++                    # A plain shrink already ran and did not clear it: rebuild
++                    # to a guaranteed-small, structurally clean request rather
++                    # than resending the same oversized one.
++                    _rebuild_history(messages, REBUILD_NOTE)
++                else:
++                    _shrink_history(messages)
+                 continue
+             if _is_cutoff(text):
+                 state["stalled"] = True
+                 if cutoffs < 2:
+                     attempt += 1
+                     _shrink_history(messages, keep_last=2 if cutoffs else 6)
+-                    injected.append(len(messages))
+                     messages.append({"role": "user", "content": CUTOFF_NOTES[cutoffs]})
+                     cutoffs += 1
+                     continue
+@@ -462,7 +581,8 @@
+     repeat = {"keys": []}
+     pace = {}
+     state = {"stalled": False,   # generations being cut off / sampled for many minutes
+-             "tool_calls": 0}    # completed tool calls; selects the watchdog deadline
++             "tool_calls": 0,    # completed tool calls; selects the watchdog deadline
++             "exec_hung": False} # an exec was killed at the cap; ride the hang-watch note
+     nudges = 0            # finish-check nudges spent over the whole run
+     bare_streak = 0       # consecutive replies without a tool call
+     delivery_seen = False # a delivery/termination-style tool has been called
+@@ -525,7 +645,7 @@
+             if call.name != "bash" and any(s in call.name.lower() for s in DELIVERY_STEMS):
+                 delivery_seen = True
+             if call.name == "bash":
+-                out = await exec_bash(world, args)
++                out = await exec_bash(world, args, t0, state)
+             elif call.name in mcp_by_name:
+                 out = await call_mcp(world, mcp_by_name[call.name], args)
+             else:
+@@ -540,7 +660,16 @@
+                         " previous ones. If you are polling for a change, poll differently (or"
+                         " wait first); otherwise stop repeating: change something in how you"
+                         " attack this, or finish the task.")
++            pressure = (_history_chars(messages) + len(out)) / COMPACT_AT_CHARS
++            if "ctx80" not in pace and pressure >= 0.8:
++                pace["ctx80"] = True
++                out += CTX_PRESSURE_80
++            elif "ctx50" not in pace and pressure >= 0.5:
++                pace["ctx50"] = True
++                out += CTX_PRESSURE_50
+             messages.append({"role": "tool", "tool_call_id": call.id,
+                              "content": out + pace_note(t0, pace)
+-                             + (STALL_NOTE if state["stalled"] else "") + "\n" + time_tag(t0)})
++                             + (STALL_NOTE if state["stalled"] else "")
++                             + (HANG_NOTE if state["exec_hung"] else "")
++                             + "\n" + time_tag(t0)})
+             _maybe_compact(messages)

@@ -1,0 +1,20 @@
+{
+  "description": "Held-out evaluation. Benchmarks with few held-out tasks are run several times and averaged.",
+  "in_distribution": [
+    {"name": "tb21", "dataset": "terminal-bench/terminal-bench-2-1", "split": "configs/splits/tb21-heldout.txt", "attempts": 3},
+    {"name": "gaia2", "dataset": "datasets/gaia2-cli", "split": "configs/splits/gaia2-heldout.txt", "host_judge": "judges.gaia2"},
+    {"name": "officeqa", "dataset": "datasets/officeqa-pro", "split": "configs/splits/officeqa-heldout.txt", "attempts": 2,
+     "env_kwargs": {"snapshot_template_name": "officeqa-pro-corpus"}},
+    {"name": "tau3", "dataset": "datasets/tau3-bench", "split": "configs/splits/tau3-heldout.txt", "attempts": 2},
+    {"name": "sbp", "dataset": "datasets/swe-bench-pro-nogit", "split": "configs/splits/sbp-heldout.txt"}
+  ],
+  "out_of_distribution": [
+    {"name": "swebv", "dataset": "datasets/swebench-verified", "split": "configs/splits/swebv-heldout.txt"},
+    {"name": "deepswe", "dataset": "datasets/deep-swe/tasks", "split": "configs/splits/deepswe-heldout.txt"},
+    {"name": "bcplus", "dataset": "datasets/browsecomp-plus", "split": "configs/splits/bcplus-heldout.txt",
+     "host_judge": "judges.browsecomp_plus", "env_kwargs": {"snapshot_template_name": "bcplus-corpus"}},
+    {"name": "apex", "dataset": "datasets/apex-agents", "split": "configs/splits/apex-heldout.txt",
+     "host_judge": "judges.apex_agents", "env_kwargs": {"snapshot_template_name": "apex-env"}},
+    {"name": "claw", "dataset": "datasets/claw-eval", "split": "configs/splits/claw-heldout.txt", "host_judge": "judges.claw_eval"}
+  ]
+}

@@ -1,0 +1,19 @@
+{
+  "description": "First stage (multi-task pretraining), as run in the paper for all four models.",
+  "iterations": 5,
+  "tasks_per_benchmark": 12,
+  "batch_seed": 0,
+  "budget": {"schedule": "cosine", "a_max": 500, "a_min": 100},
+  "repair_sessions": 3,
+  "carry_previous_session": true,
+  "max_input_tokens": 258400,
+  "benchmarks": [
+    {"name": "tb21", "dataset": "terminal-bench/terminal-bench-2-1", "train_split": "configs/splits/tb21-train.txt"},
+    {"name": "gaia2", "dataset": "datasets/gaia2-cli", "train_split": "configs/splits/gaia2-train.txt",
+     "host_judge": "judges.gaia2"},
+    {"name": "officeqa", "dataset": "datasets/officeqa-pro", "train_split": "configs/splits/officeqa-train.txt",
+     "env_kwargs": {"snapshot_template_name": "officeqa-pro-corpus"}},
+    {"name": "tau3", "dataset": "datasets/tau3-bench", "train_split": "configs/splits/tau3-train.txt"},
+    {"name": "sbp", "dataset": "datasets/swe-bench-pro-nogit", "train_split": "configs/splits/sbp-train.txt"}
+  ]
+}

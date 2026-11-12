@@ -1,0 +1,259 @@
+--- iteration03/context.py
++++ iteration04/context.py
+@@ -4,7 +4,9 @@
+ client replays on every call. `clip` bounds each tool result as it arrives, so
+ no single output can overflow the window on its own — and the bound it uses
+ depends on how full the history already is, because a result read in half is
+-a result the model has to ask for again. `compact` stubs the text
++a result the model has to ask for again — unless `keep` put the whole text in
++a file first, which is what it does for every result it clips. `compact`
++stubs the text
+ of old tool results — pure information loss, but the history's shape is
+ untouched, so the request stays well formed; in hard mode it also drops the
+ replayed reasoning of old turns, which the client rebuilds from their text and
+@@ -16,6 +18,9 @@
+ # Dropping it is the one lever that really shrinks a long history; the client
+ # rebuilds the message from its text and tool calls, so the request stays
+ # well formed, and the harness keeps a backup in case the call rejects it.
++import base64
++import itertools
++
+ STASH = ("_responses_items", "reasoning_details", "reasoning", "reasoning_content")
+ 
+ CLIP_LIMIT = 24000
+@@ -65,6 +70,44 @@
+         "read the part you need] ...\n"
+         + text[-tail:]
+     )
++
++
++_DUMPS = itertools.count(1)
++_DUMP_CHUNK = 60_000      # one exec per chunk; base64 of it stays under argv limits
++_DUMP_CAP = 450_000       # beyond this the tail of a wall of text is not worth its transfer
++
++
++async def keep(text, limit, world, stats):
++    """Clip one result, but never lose it: the whole text goes to a file.
++
++    What the window cannot hold is skipped in the middle, and the fact the
++    task needs is as often there as at either end. A re-run can fetch a
++    command's output again, but a tool the task publishes returns the same
++    wall of text every time, so the harness keeps its own copy beside the
++    task file and the clipped view names the path: the skipped middle becomes
++    a `grep` instead of a guess. The copy is base64 through the shell, so no
++    quoting, marker or newline in the text can corrupt it.
++    """
++    text = text or ""
++    if len(text) <= limit:
++        return text
++    path = f"/tmp/.harness_out_{next(_DUMPS)}.txt"
++    body = text[:_DUMP_CAP].encode()
++    try:
++        for i in range(0, len(body), _DUMP_CHUNK):
++            await world.exec(
++                f"printf %s {base64.b64encode(body[i:i + _DUMP_CHUNK]).decode()} "
++                f"| base64 -d {'>>' if i else '>'} {path}", timeout_s=60)
++        stats["kept_files"] = stats.get("kept_files", 0) + 1
++        kept = ""                     # set when the copy had to be shortened
++        if len(text) > _DUMP_CAP:
++            kept = f" (first {_DUMP_CAP} of {len(text)} characters kept)"
++    except Exception:
++        return clip(text, limit)          # the window still gets its clipped view
++    return clip(text, limit) + (
++        f"\n[harness] the full output{kept} is at {path} — read the part you "
++        "need from there (`grep`, `sed -n`, `tail`) rather than re-calling the "
++        "tool or re-running the command.")
+ 
+ 
+ def size(messages):
+--- iteration03/harness.py
++++ iteration04/harness.py
+@@ -5,8 +5,10 @@
+ the window can afford, and — once a rejection or the trigger says the window
+ is nearer than assumed — compacts until the history is *actually* inside it,
+ learning from the rejection where the limit lies. A failed call is retried,
+-but never endlessly unchanged: the task statement and the plan also live in
+-files the conversation cannot lose.
++but never endlessly unchanged, and a reply the gateway cut off mid-generation
++is answered with a smaller request rather than resent as it was: the task
++statement, the plan and the kept tool output all live in files the
++conversation cannot lose.
+ 
+ The finish guard exists because the plainest way to lose a task is to stop
+ one reply too early — the model writes the answer into its final message, the
+@@ -27,14 +29,29 @@
+ 
+ from . import context, observe
+ from .mcp import Bridge
+-from .prompts import FINISH_CHECK, SYSTEM_PROMPT, milestone_note
++from .prompts import FINISH_CHECK, GEN_CUTOFF_NOTE, SLOW_CALL_NOTE, SYSTEM_PROMPT, milestone_note
+ 
+ BASH_TIMEOUT_S = 300.0     # a command that outlives this is killed and reported
+-PROMPT_TRIGGER = 70_000    # measured prompt tokens that make us trim the history
++PROMPT_TRIGGER = 90_000    # measured prompt tokens that make us trim the history
++SLOW_CALL_S = 240.0        # a reply that took this long is thinking in the wrong place
+ MILESTONES_S = (300.0, 720.0, 1500.0, 2600.0)
+ TASK_FILE = "/tmp/.harness_task.md"
+ MAX_BOUNCES = 2            # finish checks: the second only if work happened since
++
++
+ PLAN_FILE = "/tmp/.harness_plan.md"
++
++def _generation_cutoff(err):
++    """Did the gateway stop the model mid-reply rather than reject the request?
++
++    A cut-off leaves no reply to use, and resending the same request buys
++    another cut at the same price — minutes of clock for nothing. The words
++    differ per gateway; the shape ("the reply was too long / too slow to
++    finish") is what we match, and a context rejection is handled first.
++    """
++    low = err.lower()
++    return (("generation" in low and "cut" in low) or "max_tokens" in low
++            or "token limit" in low or "length limit" in low)
+ 
+ BASH = {
+     "type": "function",
+@@ -124,7 +141,9 @@
+                      "of the run so far; bound the next such probe with "
+                      "`timeout <secs>`, or run it in the background and poll]")
+     parts.append(f"[exit {r.return_code}] " + footer(t0, plan))
+-    return context.clip("\n".join(parts), limit=context.clip_budget(hist_chars))
++    return await context.keep("\n".join(parts),
++                               limit=context.clip_budget(hist_chars), world=world,
++                               stats=stats)
+ 
+ 
+ async def write_brief(world, instruction):
+@@ -171,7 +190,8 @@
+              "bounces": 0, "milestones": 0, "plan_updates": 0,
+              "files_changed_last": None, "final_reply_chars": None,
+              "context_errors": 0, "prompt_trigger": PROMPT_TRIGGER,
+-             "longest_exec_s": 0, "model_retries": 0}
++             "longest_exec_s": 0, "model_retries": 0,
++             "gen_cutoffs": 0, "long_calls": 0, "kept_files": 0}
+     bridge = Bridge(world)
+     defs, names = await bridge.discover(instruction)
+     stats["mcp_servers"], stats["mcp_tools"] = [s[0] for s in bridge.servers], len(defs)
+@@ -204,13 +224,15 @@
+         await observe.mark_start(world)
+         while True:
+             before = model.input_tokens
++            t_call = time.monotonic()
+             try:
+                 reply = await model.chat(messages, tools=tools)
+             except Exception as e:
+                 retries += 1              # a call that raises ends the whole run, so
+                 if retries > 3:           # try again while there is anything to try
+                     raise
+-                if "context" in str(e).lower():
++                if "context" in str(e).lower():   # a rejection names the window;
++                    # a cut-off does not, so it is told apart after this one
+                     # The rejection itself says where the window is: pull the
+                     # trigger below the prompt that failed, so the run does
+                     # not walk back into the same wall next turn.
+@@ -218,6 +240,13 @@
+                     trigger = min(trigger, max(24_000, int(stats["peak_prompt_tokens"] * 0.6)))
+                     stats["prompt_trigger"] = trigger
+                     trim(keep_last=2, target=24_000)
++                elif _generation_cutoff(str(e)):
++                    stats["gen_cutoffs"] += 1
++                    # teach it once, then only shrink: the note says what to do,
++                    # the smaller history makes the next reply cheaper anyway
++                    if stats["gen_cutoffs"] <= 2:
++                        messages.append({"role": "user", "content": GEN_CUTOFF_NOTE})
++                    trim(keep_last=6, target=90_000)
+                 elif backup is not None:  # a trim is not guaranteed to be accepted,
+                     messages[:] = backup  # so put the history back and try once more
+                     backup = None
+@@ -231,6 +260,7 @@
+                     trim(keep_last=4, target=60_000)
+                 continue
+             retries, backup = 0, None
++            took_s = time.monotonic() - t_call
+             messages.append(reply.message)
+             if not reply.tool_calls:
+                 if bounces < MAX_BOUNCES and (bounces == 0 or worked):
+@@ -254,13 +284,19 @@
+                                          t0, plan)
+                 elif call.name in bridge.tools:
+                     stats["mcp_calls"] += 1
+-                    out = context.clip(await bridge.call(call.name, call.arguments),
+-                                       limit=context.clip_budget(context.size(messages)))
++                    out = await context.keep(await bridge.call(call.name, call.arguments),
++                                             limit=context.clip_budget(
++                                                 context.size(messages)),
++                                             world=world, stats=stats)
+                     out += "\n" + footer(t0, plan)
+                 else:
+                     stats["unknown_tools"] += 1
+                     out = f"unknown tool {call.name!r}: use `bash`, `plan`, or this task's MCP tools"
+                 messages.append({"role": "tool", "tool_call_id": call.id, "content": out})
++            if took_s > SLOW_CALL_S and messages[-1].get("role") == "tool":
++                stats["long_calls"] += 1
++                if stats["long_calls"] <= 2:      # a lesson, not a metronome
++                    messages.append({"role": "user", "content": SLOW_CALL_NOTE})
+             while milestone_i < len(MILESTONES_S) and time.monotonic() - t0 >= MILESTONES_S[milestone_i]:
+                 milestone_i += 1
+             if milestone_i > stats["milestones"]:
+--- iteration03/prompts.py
++++ iteration04/prompts.py
+@@ -20,7 +20,17 @@
+ 7. Tool results end with the seconds elapsed since the run began. You are not told the total budget and runs get cut off without warning, so treat the clock as the only deadline you have: never leave the deliverable unwritten while you refine, and when a reminder arrives, re-land a complete version before going on.
+ 8. A reply with no tool call ends the run, and it reaches only the harness: it is not written to a file, shown to a user, or sent anywhere the task can see. Land the deliverable with a tool — the file the task names, or the message the task routes through one of its own tools. Never answer a question that arrives *inside* the task (from a user, a program, a prompt on stdin) in a bare reply: deliver it through the channel it came from. Where the task's conditions depend on what the world does next — a reply, a result, a state that appears later — re-read the statement each time new input arrives and act on what became true; do not end the run while a condition is still waiting on something. Say your final summary only once nothing is missing.
+ 9. Before finishing, re-read the task statement and check your own work: run the task's own checks or tests if any are visible, confirm the deliverable is where and how it was asked for, and confirm nothing you were asked to do is still open. An answer that is a number or a short fact deserves a second independent route — recompute it another way, or take it from a second source — because one long derivation that is wrong looks exactly like one that is right. Fix what you find, then check again.
+-10. Anything you write under `/logs/agent/` is kept with the run's record and read later by whoever maintains this harness. If a tool, the environment, or your own approach wasted the run, a line or two there is worth more than silence. Never spend task time on it.
++10. Do what the task asks, and only that. An action that changes the world — a file
++written, a tool call that sends, creates, updates, books, orders or deletes — should
++trace back to a requirement in the statement or to a reply you received: extras count
++against you as much as omissions, and a helpful-looking extra is still a change nobody
++asked for. Where a request is ambiguous between readings, ask through the channel it
++came from and wait for the answer instead of acting on a guess — a question costs a
++turn, a wrong irreversible action costs the task. Before passing values into such an
++action, re-check each one against the place it came from: which entity, which unit,
++which time zone, which of several near-identical records, and re-read the requirement
++it is meant to satisfy.
++11. Anything you write under `/logs/agent/` is kept with the run's record and read later by whoever maintains this harness. If a tool, the environment, or your own approach wasted the run, a line or two there is worth more than silence. Never spend task time on it.
+ 
+ When the task is complete, reply with a final message and no tool calls.
+ """
+@@ -41,8 +51,11 @@
+     "the task statement become true in the meantime that was false before? "
+     "(3) Is anything you were asked to do still open? If all three are clear, "
+     "reply once more with no tool call and restate your final answer. "
+-    "Otherwise do it now and finish afterwards. Do not redo or polish work "
+-    "that is already complete."
++    "Otherwise close it now the way this task wants it closed — by doing it, or by "
++    "asking whoever can decide — and for a task carried out through tools, confirm "
++    "the world by reading it back through them (a query, a listing, a re-read) rather "
++    "than from your own summary of it. Do not redo or polish work that is already "
++    "complete."
+ )
+ 
+ 
+@@ -64,3 +77,26 @@
+                  "survives the context trims that drop the turns they were "
+                  "first thought in, and this reminder does not.")
+     return note
++
++
++# Sent when the gateway stopped a reply mid-generation: the model was trying to
++# produce too much in one turn, and the only fix is for the next reply to be
++# small — the container, not the reply, is where long work belongs.
++GEN_CUTOFF_NOTE = (
++    "[harness] Your last reply was cut off before it finished, so nothing in it "
++    "arrived. Make the next one small: no long derivation, no large paste, one "
++    "step only. Do the heavy part in the container instead — a script that "
++    "computes it and writes the result to a file, then a short reply that reads "
++    "that file and says what to do next. A reply that takes long to generate is "
++    "a reply that never lands."
++)
++
++# Sent after a reply that was generated but took a large share of the run's
++# clock: the same lesson, before the cut-off has to teach it.
++SLOW_CALL_NOTE = (
++    "[harness] That reply took several minutes to generate, which is clock the "
++    "task will not get back. If the work inside it was long — deriving, "
++    "searching, composing text — move it into the container: a script that does "
++    "it and prints or saves only the conclusion, then a short reply built on "
++    "that. Reserve the reply for decisions and the next step."
++)

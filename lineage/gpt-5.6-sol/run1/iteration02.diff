@@ -1,0 +1,186 @@
+--- iteration01/harness.py
++++ iteration02/harness.py
+@@ -1,5 +1,6 @@
+ import json
+ import mimetypes
++import re
+ import shlex
+ 
+ from . import mcp_bridge
+@@ -14,10 +15,12 @@
+ - Keep commands and output bounded: use targeted paths, grep/head/tail, summaries, and redirect verbose build/training output to a file. Avoid unrestricted recursive searches from `/`. A tool result may be clipped; rerun a narrower command rather than guessing.
+ - Long commands can consume the entire task budget. Set `timeout_s` deliberately, checkpoint useful work before expensive operations, and stop/reassess when an approach is unproductive.
+ - Maintain a concise progress ledger at `/tmp/agent_progress.md` during long tasks: goal, facts established, edits/actions, validation, and next step. The harness may compact old dialogue; the filesystem and this ledger remain available.
+-- Verify exact names, dates, units, formats, destinations, and side effects before finishing. If blocked, try reasonable alternatives and leave the best valid partial result.
+-
+-MCP application tools, when present, are exposed directly by name. Call them directly; do not implement an MCP client with bash. Follow task-specific interaction rules exactly, inspect notifications, and avoid unnecessary user-facing messages.
+-When the task is done, reply concisely with no tool calls."""
++- Verify exact names, dates, units, formats, destinations, and side effects before finishing. Check final state through an authoritative read, not just a command's success message. If blocked, try reasonable alternatives and leave the best valid partial result.
++- For ambiguous requests, distinguish details that can be discovered safely from choices that materially change the outcome. Investigate the former; ask one focused question about the latter before acting.
++- For multi-part or interactive work, keep a checklist of requested outcomes and policy gates. After each state change, record what actually succeeded. Do not silently drop an item, claim an unobserved result, repeat an irreversible action, or perform plausible extras the user did not request.
++
++MCP application tools, when present, are exposed directly by name. Call them directly; do not implement an MCP client with bash. Follow task-specific interaction and termination rules exactly, inspect notifications, and avoid unnecessary user-facing messages. Search documentation with narrow questions and synthesize the evidence before acting rather than repeatedly browsing.
++A response with no tool call ends your run. In interactive environments, communicate and finish through the designated tools; do not emit a plain response while required work remains. Otherwise, when the task is done, reply concisely with no tool calls."""
+ 
+ BASH_TOOL = {
+     "type": "function",
+@@ -108,11 +111,19 @@
+         try:
+             sid, advertised = await mcp_bridge.connect(world, server_name, url)
+             for item in advertised:
+-                name = item.get("name", "")
+-                if not name or name in routes or name in ("bash", "view_image"):
++                actual_name = item.get("name", "")
++                if not actual_name:
+                     continue
+-                routes[name] = (url, sid)
+-                tools.append(_tool_schema(item))
++                name = actual_name
++                if name in routes or name in ("bash", "view_image"):
++                    prefix = re.sub(r"[^A-Za-z0-9_-]", "_", server_name)
++                    name = f"{prefix}__{actual_name}"
++                if name in routes or name in ("bash", "view_image"):
++                    continue
++                routes[name] = (url, sid, actual_name)
++                schema = _tool_schema(item)
++                schema["function"]["name"] = name
++                tools.append(schema)
+             notices.append(f"Connected to MCP server {server_name} ({len(advertised)} tools).")
+         except Exception as exc:
+             notices.append(f"MCP server {server_name} was not auto-connected: {exc}. Use bash as a fallback.")
+@@ -125,8 +136,11 @@
+     if result.return_code:
+         return None, _clip(result.stderr or "Could not read image.")
+     data = result.stdout.strip()
+-    if len(data) > 3_000_000:
+-        return None, "Image is too large to attach. Create a smaller copy, then call view_image on it."
++    # Data URLs count against the next model request. A multi-megabyte montage can
++    # exhaust the context before vision processing starts, so require a thumbnail.
++    if len(data) > 200_000:
++        return None, ("Image is too large to attach safely. Create a thumbnail or a "
++                      "compressed crop below 200 KB, then call view_image on that file.")
+     mime = mimetypes.guess_type(path)[0] or "image/png"
+     return {"type": "input_image", "image_url": f"data:{mime};base64,{data}"}, "Image attached for visual inspection."
+ 
+@@ -140,11 +154,38 @@
+     if notices:
+         messages.append({"role": "system", "content": "\n".join(notices)})
+     tools = [BASH_TOOL, IMAGE_TOOL, *mcp_tools]
++    completion_audits = 0
+     while True:
+         messages = _shrink_history(messages)
+-        reply = await model.chat(messages, tools=tools)
++        try:
++            reply = await model.chat(messages, tools=tools)
++        except Exception as exc:
++            # A provider can count encoded media more harshly than its character
++            # length suggests. Recover once rather than losing all completed work.
++            if "context_length" not in str(exc).lower() and "context window" not in str(exc).lower():
++                raise
++            changed = False
++            for message in messages[2:]:
++                content = message.get("content")
++                if isinstance(content, list) and any(
++                    isinstance(part, dict) and part.get("type") == "input_image"
++                    for part in content
++                ):
++                    message["content"] = "[Visual attachment omitted after exceeding the model context. Recreate a smaller crop or thumbnail if it is still needed.]"
++                    message.pop("_responses_items", None)
++                    changed = True
++            if not changed:
++                raise
++            messages.append({"role": "system", "content":
++                "The previous request exceeded the context because of visual data. Continue from the retained evidence; attach only small crops or thumbnails."})
++            continue
+         messages.append(reply.message)
+         if not reply.tool_calls:
++            if completion_audits == 0:
++                completion_audits += 1
++                messages.append({"role": "system", "content":
++                    "Completion audit: independently compare the current verified state with every part of the user's request and all stated constraints. Do not repeat completed side effects. If anything remains, use tools to finish it; if not, give the final concise response."})
++                continue
+             return
+         extra_images = []
+         for call in reply.tool_calls:
+@@ -162,8 +203,8 @@
+                 elif call.name == "view_image":
+                     extra_image, output = await _view_image(world, str(call.arguments.get("path", "")))
+                 elif call.name in routes:
+-                    url, sid = routes[call.name]
+-                    output = _clip(await mcp_bridge.call(world, url, sid, call.name, call.arguments))
++                    url, sid, actual_name = routes[call.name]
++                    output = _clip(await mcp_bridge.call(world, url, sid, actual_name, call.arguments))
+                 else:
+                     output = f"Unknown tool: {call.name}"
+             except Exception as exc:
+--- iteration01/mcp_bridge.py
++++ iteration02/mcp_bridge.py
+@@ -37,18 +37,33 @@
+  q=urllib.request.Request(url,data=json.dumps(obj).encode(),headers=h)
+  with urllib.request.urlopen(q,timeout=45) as r:
+   raw=r.read().decode(errors="replace"); heads=dict(r.headers)
+- vals=[]
+- for line in raw.splitlines():
+-  if line.startswith("data:"):
+-   try: vals.append(json.loads(line[5:].strip()))
+-   except Exception: pass
++ try:
++  parsed=json.loads(raw)
++  vals=parsed if isinstance(parsed,list) else [parsed]
++ except Exception:
++  vals=[]; data=[]
++  for line in raw.splitlines()+[""]:
++   if line.startswith("data:"): data.append(line[5:].lstrip())
++   elif not line and data:
++    try:
++     parsed=json.loads("\\n".join(data))
++     vals.extend(parsed if isinstance(parsed,list) else [parsed])
++    except Exception: pass
++    data=[]
+  return heads,vals
+ h,v=post({{"jsonrpc":"2.0","id":1,"method":"initialize","params":{{"protocolVersion":"2025-03-26","capabilities":{{}},"clientInfo":{{"name":"agent-harness","version":"1"}}}}}})
+ sid=h.get("mcp-session-id") or h.get("Mcp-Session-Id")
+ post({{"jsonrpc":"2.0","method":"notifications/initialized","params":{{}}}},sid)
+-h,v=post({{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{{}}}},sid)
+-answer=next((x for x in v if x.get("id")==2),v[-1] if v else {{}})
+-out={{"sid":sid,"tools":answer.get("result",{{}}).get("tools",[])}}
++tools=[]; cursor=None
++for page in range(20):
++ params={{"cursor":cursor}} if cursor else {{}}
++ h,v=post({{"jsonrpc":"2.0","id":2,"method":"tools/list","params":params}},sid)
++ answer=next((x for x in v if x.get("id")==2),v[-1] if v else {{}})
++ result=answer.get("result",{{}})
++ tools.extend(result.get("tools",[]))
++ cursor=result.get("nextCursor")
++ if not cursor: break
++out={{"sid":sid,"tools":tools}}
+ print("MCP_BRIDGE:"+base64.b64encode(json.dumps(out).encode()).decode())'''
+     result = await world.exec(_script(code), timeout_s=60)
+     marker = next((x[11:] for x in result.stdout.splitlines() if x.startswith("MCP_BRIDGE:")), None)
+@@ -72,12 +87,20 @@
+ h={{"Content-Type":"application/json","Accept":"application/json, text/event-stream","Mcp-Session-Id":sid}}
+ q=urllib.request.Request(url,data=payload,headers=h)
+ with urllib.request.urlopen(q,timeout=900) as r: raw=r.read().decode(errors="replace")
+-vals=[]
+-for line in raw.splitlines():
+- if line.startswith("data:"):
+-  try: vals.append(json.loads(line[5:].strip()))
+-  except Exception: pass
+-answer=next((x for x in vals if x.get("id")==7),vals[-1] if vals else {{}})
++try:
++ parsed=json.loads(raw)
++ vals=parsed if isinstance(parsed,list) else [parsed]
++except Exception:
++ vals=[]; data=[]
++ for line in raw.splitlines()+[""]:
++  if line.startswith("data:"): data.append(line[5:].lstrip())
++  elif not line and data:
++   try:
++    parsed=json.loads("\\n".join(data))
++    vals.extend(parsed if isinstance(parsed,list) else [parsed])
++   except Exception: pass
++   data=[]
++answer=next((x for x in vals if isinstance(x,dict) and x.get("id")==7),vals[-1] if vals else {{}})
+ print("MCP_BRIDGE:"+base64.b64encode(json.dumps(answer).encode()).decode())'''
+     result = await world.exec(_script(code), timeout_s=930)
+     marker = next((x[11:] for x in result.stdout.splitlines() if x.startswith("MCP_BRIDGE:")), None)
